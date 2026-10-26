@@ -9,7 +9,7 @@ namespace LogixMcp.Tests;
 public class DoctorHandlerTests
 {
     private static readonly string[] ExpectedOrder =
-        ["server", "audit", "sdkInstalled", "sdkService", "cipRuntime", "echoService",
+        ["server", "audit", "sdkInstalled", "sdkService", "cipRuntime", "echoService", "echoSimulation",
          "controllerReachable", "controllerFault", "session", "pendingZone", "studio"];
 
     /// <summary>A healthy bench by default; each test breaks only what it is about.</summary>
@@ -37,6 +37,8 @@ public class DoctorHandlerTests
         public SdkServiceDiagnosisSnapshot? LastSdkServiceDiagnosis { get; set; }
         public HashSet<string> OwnAddresses { get; } = new();
         public bool IsOwnInterfaceAddress(System.Net.IPAddress address) => OwnAddresses.Contains(address.ToString());
+        public EchoSimulationReport? EchoSimulationProof { get; set; }
+        public bool EchoSimulationOptedIn { get; set; }
         public int? SdkCrashes { get; set; }
         public int? SdkServerCrashesLast24h() => SdkCrashes;
         public DateTimeOffset? NewestCrash { get; set; }
@@ -158,7 +160,13 @@ public class DoctorHandlerTests
     [Fact]
     public async Task AllChecksPresent_InOrder_WithStatus()
     {
-        var env = new FakeEnv();
+        // A healthy bench in Echo simulation mode, so the echoSimulation check applies too.
+        var env = new FakeEnv
+        {
+            EchoSimulationOptedIn = true,
+            EchoSimulationProof   = new EchoSimulationReport(true, "127.0.0.1,1,0", "ACTIVE",
+                [new EchoSimulationCheck("localAddress", true, "127.0.0.1 on Loopback")], DateTimeOffset.UtcNow),
+        };
         var r = await Run(env, commPath: @"EmulateEthernet\127.0.0.1", studio: true);
 
         Assert.Equal(ExpectedOrder, r.Checks.Select(c => c.Id).ToArray());

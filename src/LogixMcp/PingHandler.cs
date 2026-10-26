@@ -106,6 +106,15 @@ public record PingResponse(
     [JsonPropertyName("warnings")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string[]? Warnings { get; init; }
+
+    /// <summary>
+    /// The Echo simulation proof of the current session (active or not). While it is active the capability
+    /// values above are not enforced for that session. Omitted when <c>LGX_ECHO_SIM_MODE</c> is not set or no
+    /// live session has been proven.
+    /// </summary>
+    [JsonPropertyName("echoSimulation")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public EchoSimulationReport? EchoSimulation { get; init; }
 }
 
 /// <summary>

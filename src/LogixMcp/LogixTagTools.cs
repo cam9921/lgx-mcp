@@ -65,6 +65,15 @@ public class LogixTagTools
         sessionService.ConnectState = _connectState;   // logix_close_project marks it closed (id-less status)
     }
 
+    private const string EchoSimulationConnectText =
+        "Echo simulation mode: when the server runs with LGX_ECHO_SIM_MODE=1, every connect to a live " +
+        "controller is checked for a FactoryTalk Logix Echo emulator on this PC (the target IP is one of this " +
+        "PC's own addresses, ListIdentity reports a product name starting 'Emulate', the Echo service is " +
+        "running, and the route has no hops past the emulated chassis). The result's echoSimulation object " +
+        "gives each check's evidence. When echoSimulation.active is true, this session's capability flags, " +
+        "write gate and confirmation requirements are off (Echo itself still enforces each tag's External " +
+        "Access) and every action is marked in the audit log; if any check fails, every protection applies. ";
+
     // ── Agent-facing text (differs between the SDK and no-SDK builds) ─────────
 
 #if LOGIX_SDK
@@ -146,6 +155,7 @@ public class LogixTagTools
         "'online-controller' when writes reach a physical PLC; 'offline-project' otherwise. " +
         "Returns a JSON object with status, gateway, path, virtual flag, backend, tagCount " +
         "(virtual mode only), gated flag, target, and a human-readable message. " +
+        EchoSimulationConnectText +
         "The session is shared across logix_read, logix_write, and logix_poll.";
 
     private const string ConnectBackendDescription =
@@ -280,6 +290,7 @@ public class LogixTagTools
         "'online-controller' when writes reach a physical PLC; 'offline-project' otherwise. " +
         "Returns a JSON object with status, gateway, path, virtual flag, backend, tagCount " +
         "(virtual mode only), gated flag, target, and a human-readable message. " +
+        EchoSimulationConnectText +
         "The session is shared across logix_read, logix_write, and logix_poll. " +
         "If connecting fails, run logix_doctor.";
 
@@ -778,6 +789,9 @@ public class LogixTagTools
         "ProgramWritten, SafetyTag, UnknownWriteContext, ExternalAccessNotReadWrite, NotDesignated, " +
         "InvalidValue (NaN or Infinity), InvalidTagName (not a valid tag path) and " +
         "NotOnAllowlist (the site allowlist does not list the tag). " +
+        "In Echo simulation mode (logix_connect returned echoSimulation.active=true) none of these apply " +
+        "except InvalidValue and InvalidTagName, and no capability flag is needed; Echo itself still refuses " +
+        "a tag whose External Access is not Read/Write. " +
         "Call logix_connect first. " +
         "Before your first write, load the playbook: logix_get_skill(\"lgx-write-gate\").")]
     public async Task<string> WriteTag(

@@ -5,6 +5,9 @@ All notable changes to lgx-mcp. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+- Echo simulation mode (`LGX_ECHO_SIM_MODE=1`, opt-in): when `logix_connect` proves the target is a FactoryTalk Logix Echo emulator on this PC (the address is one of the PC's own, in the `Preferred` state; ListIdentity reports `Emulate...`; the Echo service is running; the route has no hops past the emulated chassis), the session's capability switches, write gate and confirmation requirements are off, so the server can be used as a logic-simulation test tool. The proof fails closed, is made again at every connect, and its address check is repeated before every skipped protection. `logix_connect`, `logix_doctor` and `logix_ping` report it as `echoSimulation` with each check's evidence; the audit log records `echo_simulation_proof`, `echo_simulation_bypass` and `echo_simulation_revoked`, and marks every record written in the mode with `"echo_simulation": true`. Echo itself still enforces each tag's External Access. See `docs/safety-model.md`.
+
 ## [1.0.1] - 2026-10-15
 
 ### Added

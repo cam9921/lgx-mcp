@@ -269,7 +269,8 @@ public static class ControllerModeHandler
         // When LGX_ENABLE_LIVE_WRITES is not set, mode changes on live controllers
         // are refused before any network or SDK call.  Mode changes on virtual,
         // L5X, and SDK offline sessions are always allowed.
-        if (capabilities is not { LiveWritesEnabled: true } && sessionService.IsLiveController)
+        if (capabilities is not { LiveWritesEnabled: true } && sessionService.IsLiveController
+            && !EchoSimulation.Bypasses(sessionService, "logix_controller_mode", Capabilities.EnvVar, mode))
         {
             AuditLogger.LogCapabilityRefusal("logix_controller_mode", Capabilities.EnvVar);
             return (
@@ -293,7 +294,8 @@ public static class ControllerModeHandler
         // Safety gate: physical controllers require explicit confirmation.
         // Changing to Program mode halts program scan — the caller must
         // acknowledge the risk by passing confirm=true.
-        if (!sessionService.IsVirtual && !confirm)
+        if (!sessionService.IsVirtual && !confirm
+            && !EchoSimulation.Bypasses(sessionService, "logix_controller_mode", "confirm", mode))
             return (
                 new ControllerModeError(
                     $"Mode change to '{mode}' refused: the session is connected to a " +

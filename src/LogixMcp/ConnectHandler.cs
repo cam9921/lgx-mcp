@@ -308,6 +308,15 @@ public record ConnectResult(
     [JsonPropertyName("retries")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public IReadOnlyList<ConnectRetryEntry>? Retries { get; init; }
+
+    /// <summary>
+    /// The Echo simulation proof made at this connect: whether simulation mode is active (every lgx-mcp
+    /// protection off for this session) and the evidence of each check. Omitted when <c>LGX_ECHO_SIM_MODE</c>
+    /// is not set or the connect has no live controller.
+    /// </summary>
+    [JsonPropertyName("echoSimulation")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public EchoSimulationReport? EchoSimulation { get; init; }
 }
 
 /// <summary>
@@ -1390,7 +1399,8 @@ public static class ConnectHandler
         Func<string, CancellationToken, Task<ControllerIdentity>>? cipIdentityReader = null,
         SdkConnectRetryPolicy? sdkConnectRetry = null,
         Func<TagSessionService, CancellationToken, Task<IReadOnlyList<DoctorZone>>>? pendingZoneReader = null,
-        ConnectState? connectState = null)
+        ConnectState? connectState = null,
+        IEchoSimulationEnvironment? echoEnvironment = null)
     {
         // ── Own connect visible at once ──────────────────────
         // Mark this instance's connect as started before any pre-work, so a status poll answers
@@ -1414,6 +1424,13 @@ public static class ConnectHandler
             if (loaded is AllowlistInvalidError invalid) return invalid;
             allowlist = (WriteAllowlist)loaded;
         }
+
+        // ── Echo simulation proof (LGX_ECHO_SIM_MODE) ─────────────────────────
+        // Made again at every connect, before any connection work, so the controller-download gate below can
+        // use it. Null, and nothing changes, unless the switch is set and the target is a live controller.
+        var echoProof = await EchoSimulation.ProveAsync(
+            backend, gateway, path, sdkCommPath, sdkMode, useVirtual, echoEnvironment, ct).ConfigureAwait(false);
+        if (echoProof is not null) AuditLogger.LogEchoSimulationProof(echoProof);
 
         // ── Staged work the new session would discard ──
         // A connect replaces the active session, and a session's staged-rung buffer lives and dies with it.
@@ -1441,10 +1458,15 @@ public static class ConnectHandler
             gateway, path, useVirtual, projectService, sessionService, backend, ct,
             modeService, sdkFactory, sdkMode, allowControllerDownload, sdkCommPath,
             controllerReachableProbe, capabilities, cipConnectProbe, allowlist?.Sha256, progress,
-            cipProbeDeadline, confirmedByUser, cipRouteConnector, cipIdentityReader, sdkConnectRetry);
+            cipProbeDeadline, confirmedByUser, cipRouteConnector, cipIdentityReader, sdkConnectRetry, echoProof);
 
-        // Activate the allowlist for the session just attached (Attach cleared any previous one).
-        if (result is ConnectResult) sessionService.SetWriteAllowlist(allowlist);
+        // Activate the allowlist and the Echo simulation proof for the session just attached (Attach cleared
+        // any previous ones).
+        if (result is ConnectResult)
+        {
+            sessionService.SetWriteAllowlist(allowlist);
+            sessionService.SetEchoSimulationProof(echoProof);
+        }
 
         if (result is not ConnectResult connected) return result;
 
@@ -1492,7 +1514,9 @@ public static class ConnectHandler
                 : null,
             UnparsedRungs         = unparsed is { Count: > 0 } ? UnparsedContent.RungsOf(unparsed) : null,
             Warnings              = warnings,
+            EchoSimulation        = echoProof,
             Message               = (replacedNote is null ? connected.Message : connected.Message + " " + replacedNote)
+                + (echoProof is { Active: true } ? " " + echoProof.Summary : "")
                 + (configWarnings is null && discardedWarning is null && orphanedWarning is null
                 ? ""
                 : " Warning: " +
@@ -1530,7 +1554,8 @@ public static class ConnectHandler
         bool                   confirmedByUser        = false,
         Func<string, string, CancellationToken, Task<ITagService>>? cipRouteConnector = null,
         Func<string, CancellationToken, Task<ControllerIdentity>>? cipIdentityReader = null,
-        SdkConnectRetryPolicy? sdkConnectRetry = null)
+        SdkConnectRetryPolicy? sdkConnectRetry = null,
+        EchoSimulationReport?  echoProof = null)
     {
         // backend="virtual" is an alias of useVirtual=true.
         if (!useVirtual && string.Equals(backend?.Trim(), "virtual", StringComparison.OrdinalIgnoreCase))
@@ -1633,7 +1658,8 @@ public static class ConnectHandler
         // operation the connect handler can perform — it stops the running
         // controller, overwrites its stored program, and disconnects all online
         // sessions — so it requires an explicit opt-in beyond the existing flag.
-        if (capabilities is not { LiveWritesEnabled: true } && allowControllerDownload)
+        if (capabilities is not { LiveWritesEnabled: true } && allowControllerDownload
+            && !EchoSimulation.Bypasses(echoProof, "logix_connect", Capabilities.EnvVar))
         {
             AuditLogger.LogCapabilityRefusal("logix_connect", Capabilities.EnvVar);
             return new CapabilityDisabledError(
@@ -1655,7 +1681,8 @@ public static class ConnectHandler
         // per-call confirmedByUser=true. Both are refused before any network or SDK call.
         if (allowControllerDownload)
         {
-            if (capabilities is not { ControllerDownloadEnabled: true })
+            if (capabilities is not { ControllerDownloadEnabled: true }
+                && !EchoSimulation.Bypasses(echoProof, "logix_connect", Capabilities.EnvVarControllerDownload))
             {
                 AuditLogger.LogCapabilityRefusal("logix_connect", Capabilities.EnvVarControllerDownload);
                 return new CapabilityDisabledError(
@@ -1670,7 +1697,7 @@ public static class ConnectHandler
                         $"Client command: {Capabilities.ClientCommandHintControllerDownload}");
             }
 
-            if (!confirmedByUser)
+            if (!confirmedByUser && !EchoSimulation.Bypasses(echoProof, "logix_connect", "confirmedByUser"))
             {
                 return new ConfirmationRequiredError(
                     Error:

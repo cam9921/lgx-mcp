@@ -157,11 +157,18 @@ public static class GateReportHandler
                         GatePolicyOrigin.ProjectFile, service.FilePath, EnforcedBySession: true),
                 };
             // Partial export plus allowlist: grants come only from the allowlist.
-            if (gated.GrantsFromAllowlist && allowlist is not null)
-                return BuildPartialAllowlistPolicy(gated.Policy, allowlist, service.FilePath);
+            // Otherwise, reporting only: the allowlist narrows writes but never alters the policy lists.
+            var report = gated.GrantsFromAllowlist && allowlist is not null
+                ? BuildPartialAllowlistPolicy(gated.Policy, allowlist, service.FilePath)
+                : allowlist is null ? enforced : enforced with { Allowlist = allowlist };
 
-            // Reporting only: the allowlist narrows writes but never alters the policy lists.
-            return allowlist is null ? enforced : enforced with { Allowlist = allowlist };
+            // Echo simulation mode: the session derives this policy but does not enforce it, so it is reported
+            // the way every unenforced policy is: hypothetical, with the reason.
+            if (session.ActiveEchoSimulation is null) return report;
+            return new HypotheticalGateResult(
+                report with { Origin = report.Origin is { } origin ? origin with { EnforcedBySession = false } : null },
+                GateConfigResolver.Current, Array.Empty<DivergenceEntry>(), EchoSimulationReason,
+                CustomPrefixes: false);
         }
 
         if (!service.IsLoaded)
@@ -229,6 +236,14 @@ public static class GateReportHandler
         "Partial export plus write allowlist: grants come only from the allowlist; the partial file's " +
         "denies and ranges still apply. Only tags the allowlist names are listed. A prefix entry (ending in '*') " +
         "also grants tags the file does not declare, which cannot be enumerated here.";
+
+    /// <summary>
+    /// Why a gated session's report is not enforced while the session is in Echo simulation mode. Shown as the
+    /// reason of a <see cref="HypotheticalGateResult"/>, so the report is labelled <c>hypothetical</c>.
+    /// </summary>
+    internal const string EchoSimulationReason =
+        "Echo simulation mode is active for this session (LGX_ECHO_SIM_MODE, proven at logix_connect), so " +
+        "logix_write bypasses this policy; it shows what a write would meet on a real controller";
 
     /// <summary>
     /// Builds the enforced report for a partial export gated by a write allowlist. The session's

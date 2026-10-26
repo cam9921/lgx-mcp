@@ -325,6 +325,24 @@ public static class AuditLogger
     /// <summary>Overrides <see cref="FailClosed"/> for the current execution context. Intended for tests.</summary>
     internal static void OverrideFailClosed(bool? value) => _failClosedOverride.Value = value;
 
+    private static readonly AsyncLocal<bool?> _echoSimulationOverride = new();
+
+    /// <summary>
+    /// Reports whether the server's session is in Echo simulation mode. Set once at startup to read the
+    /// session singleton; <c>null</c> (the default, and in tests) means "never".
+    /// </summary>
+    public static Func<bool>? EchoSimulationSource { get; set; }
+
+    /// <summary>Overrides <see cref="EchoSimulationActive"/> for the current execution context. Intended for tests.</summary>
+    internal static void OverrideEchoSimulation(bool? value) => _echoSimulationOverride.Value = value;
+
+    /// <summary>
+    /// <c>true</c> while the session is in Echo simulation mode: every record appended then carries
+    /// <c>"echo_simulation": true</c>.
+    /// </summary>
+    public static bool EchoSimulationActive =>
+        _echoSimulationOverride.Value ?? (EchoSimulationSource?.Invoke() ?? false);
+
     /// <summary>
     /// <c>true</c> when <c>LGX_AUDIT_FAIL_CLOSED</c> is <c>1</c>, <c>true</c> or <c>yes</c>: a write is refused when the
     /// pre-write check finds the audit log cannot be opened for append, with <see cref="ErrorKinds.AuditUnavailable"/>.
@@ -384,6 +402,10 @@ public static class AuditLogger
             var logDir = LogDirectory;
             var line   = JsonSerializer.Serialize(evt, _opts);
             var path   = Path.Combine(logDir, "audit.jsonl");
+
+            // Every record written while the session is in Echo simulation mode says so, whatever its event.
+            if (EchoSimulationActive)
+                line = line[..^1] + (line.Length > 2 ? "," : "") + "\"echo_simulation\":true}";
 
             lock (_lock)
             {
@@ -1304,6 +1326,59 @@ public static class AuditLogger
             @event    = "capability_refusal",
             operation,
             env_var   = envVar,
+        });
+    }
+
+    /// <summary>
+    /// Logs the Echo simulation proof made at one <c>logix_connect</c>, active or not, with every check's evidence.
+    /// </summary>
+    /// <param name="report">The proof.</param>
+    public static void LogEchoSimulationProof(EchoSimulationReport report)
+    {
+        Append(new
+        {
+            ts       = Timestamp(),
+            @event   = "echo_simulation_proof",
+            active   = report.Active,
+            target   = report.Target,
+            checks   = report.Checks.Select(c => new { name = c.Name, passed = c.Passed, evidence = c.Evidence }).ToArray(),
+        });
+    }
+
+    /// <summary>
+    /// Logs one protection skipped because the session is in Echo simulation mode.
+    /// </summary>
+    /// <param name="operation">The tool whose protection was skipped.</param>
+    /// <param name="protection">The protection: an environment variable, a deny reason, or <c>confirmedByUser</c>.</param>
+    /// <param name="target">The proven Echo target.</param>
+    /// <param name="subject">The tag or object concerned, or <c>null</c>.</param>
+    public static void LogEchoSimulationBypass(string operation, string protection, string target, string? subject)
+    {
+        Append(new
+        {
+            ts         = Timestamp(),
+            @event     = "echo_simulation_bypass",
+            operation,
+            protection,
+            target,
+            subject,
+        });
+    }
+
+    /// <summary>
+    /// Logs the end of Echo simulation mode for a session because a re-check found the target is no longer
+    /// one of this PC's own addresses.
+    /// </summary>
+    /// <param name="target">The target that was proven at connect.</param>
+    /// <param name="reason">What the failed re-check observed.</param>
+    public static void LogEchoSimulationRevoked(string target, string reason)
+    {
+        Append(new
+        {
+            ts     = Timestamp(),
+            @event = "echo_simulation_revoked",
+            target,
+            reason,
         });
     }
 

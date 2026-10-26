@@ -240,7 +240,9 @@ public static class RunTestHandler
                       "(product name starting with 'Emulate').");
 
         // ── Capability and confirmation ───────────────────────────────────────
-        if (capabilities is not { LiveWritesEnabled: true })
+        // In Echo simulation mode the flag counts as set and no confirmation is needed.
+        if (capabilities is not { LiveWritesEnabled: true }
+            && !EchoSimulation.Bypasses(session, "logix_run_test", Capabilities.EnvVar))
         {
             AuditLogger.LogCapabilityRefusal("logix_run_test", Capabilities.EnvVar);
             return new RunTestError(
@@ -251,7 +253,7 @@ public static class RunTestHandler
                       $"Client command: {Capabilities.ClientCommandHint}");
         }
 
-        if (!confirmedByUser)
+        if (!confirmedByUser && !EchoSimulation.Bypasses(session, "logix_run_test", "confirmedByUser"))
             return new RunTestError(
                 "logix_run_test refused: confirmedByUser is not true. A test run writes tag values on the " +
                 "controller (restoring them afterwards). Nothing was written.",
@@ -282,7 +284,11 @@ public static class RunTestHandler
         }
 
         // ── Test write rules: every tag of every case, before anything is written ──
-        if (session.Service is not GatedTagService gated)
+        // In Echo simulation mode the rules are not applied and no write gate is needed; Echo itself still
+        // enforces each tag's External Access.
+        var gated   = session.Service as GatedTagService;
+        var echoSim = EchoSimulation.Bypasses(session, "logix_run_test", "TestWriteRules");
+        if (gated is null && !echoSim)
             return new RunTestError(
                 "logix_run_test refused: the session has no write-gate policy, so it cannot be shown that " +
                 "the tags to set are not written by program logic. Nothing was written.",
@@ -297,10 +303,10 @@ public static class RunTestHandler
         {
             var seen   = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var denied = new List<TestWriteDisclosure>();
-            foreach (var s in SetsOf(c))
+            foreach (var s in echoSim ? Enumerable.Empty<RunTestSet>() : SetsOf(c))
             {
                 if (!seen.Add(s.Tag)) continue;
-                var d = TestWriteRules.Evaluate(s.Tag, gated.Policy, session, session.WriteAllowlist);
+                var d = TestWriteRules.Evaluate(s.Tag, gated!.Policy, session, session.WriteAllowlist);
                 if (d.Refusal is { } r) refusals.Add(r);
                 else if (d.OrdinaryDenial is { } o) denied.Add(o);
             }
@@ -323,7 +329,7 @@ public static class RunTestHandler
         // ── Tag route (LGX_TAG_ROUTE): resolve before anything is written ─────
         // In cip mode with no CIP route the whole run is refused with the typed error rather than
         // reported case by case.
-        if (gated.InnerService is RoutedTagService routed)
+        if ((gated?.InnerService ?? session.Service) is RoutedTagService routed)
         {
             try { await routed.ResolveRouteAsync(ct).ConfigureAwait(false); }
             catch (TagServiceException ex) when (ex.Error.Kind == TagServiceErrorKind.TagRouteUnavailable)
@@ -337,7 +343,7 @@ public static class RunTestHandler
         // Reads use the session service; allowed writes go straight to the typed SDK service
         // beneath the gate, because the ordinary grant list is not the test rule.
         var service  = session.Service!;
-        var writer   = gated.InnerService;
+        var writer   = gated?.InnerService ?? service;
         var wait     = delay ?? ((ms, token) => Task.Delay(ms, token));
         var total    = System.Diagnostics.Stopwatch.StartNew();
         var results  = new List<RunTestCaseResult>(cases.Count);

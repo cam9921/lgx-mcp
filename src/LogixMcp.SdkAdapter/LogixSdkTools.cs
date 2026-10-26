@@ -587,8 +587,10 @@ public class LogixSdkTools
             // This change gate 1: target="live" additionally requires LGX_ENABLE_LIVE_FINALIZE.
             // Checked first so a disabled flag is always reported before anything else,
             // and before any session work or SDK import.
+            // In Echo simulation mode every flag counts as set and no confirmation is needed.
             if (string.Equals(target, "live", StringComparison.OrdinalIgnoreCase) &&
-                _capabilities is not { LiveFinalizeEnabled: true })
+                _capabilities is not { LiveFinalizeEnabled: true } &&
+                !EchoSimulation.Bypasses(_tagSessionService, "logix_propose_rung_edit", Capabilities.EnvVarLiveFinalize))
             {
                 AuditLogger.LogCapabilityRefusal(
                     "logix_propose_rung_edit", Capabilities.EnvVarLiveFinalize);
@@ -614,7 +616,8 @@ public class LogixSdkTools
             bool isControllerTarget =
                 string.Equals(target, "controller", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(target, "live",       StringComparison.OrdinalIgnoreCase);
-            if (_capabilities is not { LiveWritesEnabled: true } && isControllerTarget)
+            if (_capabilities is not { LiveWritesEnabled: true } && isControllerTarget &&
+                !EchoSimulation.Bypasses(_tagSessionService, "logix_propose_rung_edit", Capabilities.EnvVar))
             {
                 AuditLogger.LogCapabilityRefusal("logix_propose_rung_edit", Capabilities.EnvVar);
                 LogGateRefusal("CapabilityDisabled");
@@ -651,7 +654,8 @@ public class LogixSdkTools
                 string.Equals(target, "controller", StringComparison.OrdinalIgnoreCase) ||
                 isLiveTarget;
             if ((isLiveTarget || _capabilities is not { PublishMode: PublishMode.Auto })
-                && isControllerTarget && !confirmedByUser)
+                && isControllerTarget && !confirmedByUser
+                && !EchoSimulation.Bypasses(_tagSessionService, "logix_propose_rung_edit", "confirmedByUser"))
             {
                 // Peek at staged state from the session without making any SDK call.
                 // GetNewStagedTagNames filters StagedTagBuffer against PreStageTagCensus
@@ -1157,13 +1161,14 @@ public class LogixSdkTools
             // target="live" is gated by the flag and by confirmedByUser regardless of
             // LGX_PUBLISH_MODE, and those refusals must not be masked by the
             // no-session error.
-            bool confirmGateWouldFire =
+            // In Echo simulation mode none of those gates fires.
+            bool confirmGateWouldFire = _tagSessionService.ActiveEchoSimulation is null && (
                 (isLiveTarget && (_capabilities is not { LiveFinalizeEnabled: true } ||
                                   _capabilities is not { LiveWritesEnabled: true } ||
                                   !confirmedByUser)) ||
                 (_capabilities is not { PublishMode: PublishMode.Auto } &&
                  isControllerTarget &&
-                 !confirmedByUser);
+                 !confirmedByUser));
             if (liveSession is null && !confirmGateWouldFire)
             {
                 AuditLogger.LogRungEdit(routineXPath, insertAt, "refused", null,
@@ -1545,8 +1550,11 @@ public class LogixSdkTools
         }
 
         var result = await FinalizeEditsHandler.ExecuteAsync(
-            program, routine, confirm, sdkSession, ct,
-            studioAutomationEnabled: _capabilities is { StudioAutomationEnabled: true });
+            program, routine,
+            confirm || EchoSimulation.Bypasses(_tagSessionService, "logix_finalize_edits", "confirm"),
+            sdkSession, ct,
+            studioAutomationEnabled: _capabilities is { StudioAutomationEnabled: true }
+                                     || _tagSessionService.ActiveEchoSimulation is not null);
         return JsonSerializer.Serialize(result);
     }
 
@@ -1678,7 +1686,8 @@ public class LogixSdkTools
         // menu command IDs (no keystrokes, no mouse clicks, no screen coordinates).
         // Refused when the opt-in is not set, before any
         // Studio-installed probe, pending-edit read, or session-1 script call.
-        if (_capabilities is not { StudioAutomationEnabled: true })
+        if (_capabilities is not { StudioAutomationEnabled: true } &&
+            !EchoSimulation.Bypasses(_tagSessionService, "logix_cancel_pending_edits", Capabilities.EnvVarStudio))
         {
             AuditLogger.LogCapabilityRefusal("logix_cancel_pending_edits", Capabilities.EnvVarStudio);
             return JsonSerializer.Serialize(
@@ -1724,7 +1733,9 @@ public class LogixSdkTools
             ((verb, token) => RunLifecycleDriverAsync(verb, program, routine, sdkSession, probe, token));
 
         var result = await CancelPendingEditsHandler.ExecuteAsync(
-            program, routine, confirm, PendingEditsReader, runner, isStudioInstalled, ct,
+            program, routine,
+            confirm || EchoSimulation.Bypasses(_tagSessionService, "logix_cancel_pending_edits", "confirm"),
+            PendingEditsReader, runner, isStudioInstalled, ct,
             planLaunch: () => Session1ScriptRunner.PlanLaunch(probe),
             leftoverTagsProvider: () => _tagSessionService.TakeZoneCreatedTagNames(program, routine),
             imageSession: _tagSessionService,
@@ -1920,7 +1931,8 @@ public class LogixSdkTools
         bool                                                         acceptForeign = false)
     {
         // Gate 0: refused before any Studio probe, pending-edit read, or GUI action.
-        if (_capabilities is not { StudioAutomationEnabled: true })
+        if (_capabilities is not { StudioAutomationEnabled: true } &&
+            !EchoSimulation.Bypasses(_tagSessionService, "logix_accept_pending_edits", Capabilities.EnvVarStudio))
         {
             AuditLogger.LogCapabilityRefusal("logix_accept_pending_edits", Capabilities.EnvVarStudio);
             return JsonSerializer.Serialize(
@@ -1967,7 +1979,9 @@ public class LogixSdkTools
             ((verb, token) => RunLifecycleDriverAsync(verb, program, routine, sdkSession, probe, token));
 
         var result = await AcceptPendingEditsHandler.ExecuteAsync(
-            program, routine, confirm, PendingEditsReader, runner, isStudioInstalled, ct,
+            program, routine,
+            confirm || EchoSimulation.Bypasses(_tagSessionService, "logix_accept_pending_edits", "confirm"),
+            PendingEditsReader, runner, isStudioInstalled, ct,
             () => Session1ScriptRunner.PlanLaunch(probe), _tagSessionService,
             acceptForeign, sdkSession);
         return JsonSerializer.Serialize(result);
@@ -2075,7 +2089,8 @@ public class LogixSdkTools
     /// </summary>
     private string? RefuseWithoutLiveWrites(string toolName)
     {
-        if (_capabilities is { LiveWritesEnabled: true })
+        if (_capabilities is { LiveWritesEnabled: true } ||
+            EchoSimulation.Bypasses(_tagSessionService, toolName, Capabilities.EnvVar))
             return null;
 
         AuditLogger.LogCapabilityRefusal(toolName, Capabilities.EnvVar);
@@ -2119,7 +2134,8 @@ public class LogixSdkTools
         bool                                                         acceptForeign = false)
     {
         // Gate 0: refused before any Studio probe, pending-edit read, or GUI action.
-        if (_capabilities is not { StudioAutomationEnabled: true })
+        if (_capabilities is not { StudioAutomationEnabled: true } &&
+            !EchoSimulation.Bypasses(_tagSessionService, toolName, Capabilities.EnvVarStudio))
         {
             AuditLogger.LogCapabilityRefusal(toolName, Capabilities.EnvVarStudio);
             return JsonSerializer.Serialize(
@@ -2171,7 +2187,9 @@ public class LogixSdkTools
             ((verb, token) => RunLifecycleDriverAsync(verb, program, routine, sdkSession, probe, token));
 
         var result = await handler(
-            program, routine, confirm, PendingEditsReader, runner, isStudioInstalled, ct,
+            program, routine,
+            confirm || EchoSimulation.Bypasses(_tagSessionService, toolName, "confirm"),
+            PendingEditsReader, runner, isStudioInstalled, ct,
             () => Session1ScriptRunner.PlanLaunch(probe), acceptForeign, sdkSession);
 
         // An assembled (or accepted) zone can no longer be cancelled: its comment undos are void.
@@ -2640,8 +2658,11 @@ public class LogixSdkTools
         }
 
         var result = await CreateRoutineHandler.ExecuteAsync(
-            program, name, type, description, confirmedByUser, sdkSession,
-            liveWritesEnabled: _capabilities is { LiveWritesEnabled: true },
+            program, name, type, description,
+            confirmedByUser || EchoSimulation.Bypasses(_tagSessionService, "logix_create_routine", "confirmedByUser"),
+            sdkSession,
+            liveWritesEnabled: _capabilities is { LiveWritesEnabled: true }
+                               || EchoSimulation.Bypasses(_tagSessionService, "logix_create_routine", Capabilities.EnvVar),
             allowlist:         _tagSessionService.WriteAllowlist,
             ct:                ct);
         return JsonSerializer.Serialize(result, result.GetType());

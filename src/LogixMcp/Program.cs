@@ -98,6 +98,11 @@ var host = builder.Build();
     var pingSessions = host.Services.GetRequiredService<TagSessionService>();
     var pingProject  = host.Services.GetRequiredService<ProjectService>();
     LogixTools.CurrentTarget = () => TargetRevision.Current(pingSessions, pingProject);
+
+    // Echo simulation mode lives on the session: ping reports it, and every audit record written while it is
+    // active is marked.
+    LogixTools.CurrentEchoSimulation = () => pingSessions.EchoSimulationProof;
+    AuditLogger.EchoSimulationSource = () => pingSessions.ActiveEchoSimulation is not null;
 }
 
 await host.RunAsync();
@@ -154,7 +159,7 @@ public static class LogixTools
                              confirm (default): the server refuses a controller publish unless the agent passes confirmedByUser=true, which it may only do after the user explicitly approves; auto proceeds.
         Writes are gate-enforced and every denial cites the L5X element behind it.
         Live controller writes, mode changes, publishes, and downloads are disabled
-        unless LGX_ENABLE_LIVE_WRITES=1 is set in the server environment.
+        unless LGX_ENABLE_LIVE_WRITES=1 is set in the server environment. Echo simulation mode: with LGX_ECHO_SIM_MODE=1, a connect proven to reach a FactoryTalk Logix Echo emulator on this PC (logix_connect's echoSimulation.active=true) turns that session's capability flags, write gate and confirmation requirements off; Echo still enforces External Access.
         """;
 #else
     public const string CanonicalInstructions =
@@ -173,7 +178,7 @@ public static class LogixTools
         Setup or connect trouble: run logix_doctor first (read-only health check).
         Writes are gate-enforced and every denial cites the L5X element behind it.
         Live controller writes and mode changes are disabled
-        unless LGX_ENABLE_LIVE_WRITES=1 is set in the server environment.
+        unless LGX_ENABLE_LIVE_WRITES=1 is set in the server environment. Echo simulation mode: with LGX_ECHO_SIM_MODE=1, a connect proven to reach a FactoryTalk Logix Echo emulator on this PC (logix_connect's echoSimulation.active=true) turns that session's capability flags, write gate and confirmation requirements off; Echo still enforces External Access.
         """;
 #endif
 
@@ -198,6 +203,12 @@ public static class LogixTools
     public static Func<TargetRevisionInfo>? CurrentTarget { get; set; }
 
     /// <summary>
+    /// Supplies the current session's Echo simulation proof to <c>logix_ping</c>; set at startup to read the
+    /// session registry. <c>null</c> (tests, before startup) reports none.
+    /// </summary>
+    public static Func<EchoSimulationReport?>? CurrentEchoSimulation { get; set; }
+
+    /// <summary>
     /// Builds the ping response payload as a JSON string with the supplied
     /// capability flags.  Intended for unit tests that need to inject specific
     /// capability values without mutating the process environment.
@@ -219,7 +230,10 @@ public static class LogixTools
     /// <param name="target">The target's revision; <c>null</c> reports no target (<c>unknown</c>, no warning).</param>
     /// <returns>JSON string including <c>targetMajorRevision</c> and <c>mnemonicSet</c>.</returns>
     public static string GetPingResponse(Capabilities? capabilities, TargetRevisionInfo? target) =>
-        JsonSerializer.Serialize(PingHandler.Execute(capabilities, target));
+        JsonSerializer.Serialize(PingHandler.Execute(capabilities, target) with
+        {
+            EchoSimulation = CurrentEchoSimulation?.Invoke(),
+        });
 
     /// <summary>
     /// Health check tool. Delegates to <see cref="GetPingResponse"/>.

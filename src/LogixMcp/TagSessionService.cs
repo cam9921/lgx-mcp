@@ -120,6 +120,40 @@ public class TagSessionService : IDisposable
     }
 
     /// <summary>
+    /// The Echo simulation proof made at this session's <c>logix_connect</c> (active or not), or <c>null</c> when
+    /// <see cref="EchoSimulation.EnvVar"/> is not set or the session has no live controller. Cleared by
+    /// <see cref="Attach"/> and <see cref="Detach"/>, so every connect has to prove itself again.
+    /// </summary>
+    public EchoSimulationReport? EchoSimulationProof { get; private set; }
+
+    /// <summary>
+    /// The active proof while the session is in Echo simulation mode, else <c>null</c>. Protections are
+    /// skipped through <see cref="EchoSimulation.Bypasses(TagSessionService?, string, string, string?)"/>,
+    /// which also re-checks that the target is still a local address.
+    /// </summary>
+    public EchoSimulationReport? ActiveEchoSimulation => EchoSimulationProof is { Active: true } proof ? proof : null;
+
+    /// <summary>Records the proof made by the connect that attached this session.</summary>
+    /// <param name="proof">The proof, active or not, or <c>null</c>.</param>
+    public void SetEchoSimulationProof(EchoSimulationReport? proof) => EchoSimulationProof = proof;
+
+    /// <summary>
+    /// Ends Echo simulation mode for the rest of the session (full protections apply again) and audits why.
+    /// Called when a re-check finds the target is no longer one of this PC's own addresses.
+    /// </summary>
+    /// <param name="reason">What the failed re-check observed.</param>
+    public void RevokeEchoSimulation(string reason)
+    {
+        if (EchoSimulationProof is not { Active: true } proof) return;
+        EchoSimulationProof = proof with
+        {
+            Active  = false,
+            Summary = "Echo simulation mode was revoked, so every protection applies again: " + reason + ".",
+        };
+        AuditLogger.LogEchoSimulationRevoked(proof.Target, reason);
+    }
+
+    /// <summary>
     /// Gets the active <see cref="ITagService"/>, or <c>null</c> when no session
     /// has been established.
     /// </summary>
@@ -691,6 +725,7 @@ public class TagSessionService : IDisposable
         _liveEditedRoutines.Clear();
         _liveEditedTags.Clear();
         WriteAllowlist = null;
+        EchoSimulationProof = null;
         AuditController = null;
         TargetRevision = null;
         NoGateReason = null;
@@ -844,6 +879,7 @@ public class TagSessionService : IDisposable
         _isVirtual        = false;
         _isLiveController = false;
         _controllerHost   = null;
+        EchoSimulationProof = null;
         AuditController   = null;
         TargetRevision    = null;
         NoGateReason      = null;

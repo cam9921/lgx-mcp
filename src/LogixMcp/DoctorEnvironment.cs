@@ -461,6 +461,12 @@ public sealed class DoctorEnvironment : IDoctorEnvironment
     public TargetRevisionInfo GetTargetRevision() => TargetRevision.Current(_tagSessions, _project);
 
     /// <inheritdoc />
+    public EchoSimulationReport? EchoSimulationProof => _tagSessions?.EchoSimulationProof;
+
+    /// <inheritdoc />
+    public bool EchoSimulationOptedIn => EchoSimulation.DefaultEnvironment.OptedIn;
+
+    /// <inheritdoc />
     public Task<IReadOnlyList<DoctorZone>> ReadPendingZonesAsync(CancellationToken ct)
     {
         var sdk = Observations

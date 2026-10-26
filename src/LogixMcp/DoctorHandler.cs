@@ -230,6 +230,15 @@ public interface IDoctorEnvironment
     bool IsOwnInterfaceAddress(IPAddress address) => false;
 
     /// <summary>
+    /// The Echo simulation proof of the current session (active or not), or null when none was made.
+    /// Read-only. The default reports none.
+    /// </summary>
+    EchoSimulationReport? EchoSimulationProof => null;
+
+    /// <summary>Whether <c>LGX_ECHO_SIM_MODE</c> is set for this server. The default reports false.</summary>
+    bool EchoSimulationOptedIn => false;
+
+    /// <summary>
     /// Number of <c>LdSdkServer.exe</c> crashes in the Windows Application event log (source <c>.NET Runtime</c> or
     /// <c>Application Error</c>) in the last 24 hours, or null when the log cannot be read (not Windows, no SDK
     /// build, access denied). The default reports null.
@@ -334,7 +343,7 @@ public static class DoctorHandler
     /// <summary>The check ids, in execution order.</summary>
     public static readonly IReadOnlyList<string> CheckIds =
     [
-        "server", "audit", "sdkInstalled", "sdkService", "cipRuntime", "echoService",
+        "server", "audit", "sdkInstalled", "sdkService", "cipRuntime", "echoService", "echoSimulation",
         "controllerReachable", "controllerFault", "session", "pendingZone", "studio",
     ];
 
@@ -372,6 +381,7 @@ public static class DoctorHandler
             Guard("sdkService",   () => CheckSdkService(env)),
             Guard("cipRuntime",   () => CheckCipRuntime(env)),
             Guard("echoService",  () => CheckEchoService(env, commPath, controllerIp)),
+            Guard("echoSimulation", () => CheckEchoSimulation(env)),
             reachable,
             await GuardAsync("controllerFault", () => CheckControllerFaultAsync(env, commPath, controllerIp, reachable, ct)),
             Guard("session",      () => CheckSession(env, commPath)),
@@ -741,6 +751,33 @@ public static class DoctorHandler
         return new DoctorCheck("echoService", DoctorStatus.Ok, observed);
     }
 
+    // ── 5b. echoSimulation ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Reports Echo simulation mode: whether the current session is in it (every lgx-mcp protection off) and the
+    /// evidence of each check of its proof. ok when the mode is active, warn when it was asked for
+    /// (<c>LGX_ECHO_SIM_MODE</c> set) but the proof failed, skipped otherwise. Never a failure: the mode fails closed.
+    /// </summary>
+    private static DoctorCheck CheckEchoSimulation(IDoctorEnvironment env)
+    {
+        if (env.EchoSimulationProof is { } proof)
+        {
+            var observed = proof.Summary + " Evidence: " +
+                string.Join("; ", proof.Checks.Select(c => $"{c.Name} {(c.Passed ? "passed" : "FAILED")}: {c.Evidence}")) +
+                ".";
+            return proof.Active
+                ? new DoctorCheck("echoSimulation", DoctorStatus.Ok, observed)
+                : new DoctorCheck("echoSimulation", DoctorStatus.Warn, observed,
+                    "Fix the failed checks (a local Echo controller, path '1,<slot>', the Echo service running), " +
+                    "then call logix_connect again. Until then every protection applies.");
+        }
+
+        return new DoctorCheck("echoSimulation", DoctorStatus.Skipped, env.EchoSimulationOptedIn
+            ? $"{EchoSimulation.EnvVar} is set, but no live session has been proven: the proof is made at each " +
+              "logix_connect to a CIP or online SDK target. Until then every protection applies"
+            : $"{EchoSimulation.EnvVar} is not set, so Echo simulation mode is off and every protection applies");
+    }
+
     // ── 6. controllerReachable ────────────────────────────────────────────────
 
     private static async Task<DoctorCheck> CheckControllerReachableAsync(
@@ -946,7 +983,8 @@ public static class DoctorHandler
 
     private static DoctorCheck CheckStudio(IDoctorEnvironment env, Capabilities caps)
     {
-        if (!caps.StudioAutomationEnabled)
+        // In Echo simulation mode the Studio tools are available, so Studio is checked.
+        if (!caps.StudioAutomationEnabled && env.EchoSimulationProof is not { Active: true })
             return new DoctorCheck("studio", DoctorStatus.Skipped,
                 $"{Capabilities.EnvVarStudio} is not 1, so Studio automation is off");
 

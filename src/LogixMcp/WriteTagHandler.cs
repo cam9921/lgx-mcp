@@ -204,7 +204,9 @@ public static class WriteTagHandler
         // When LGX_ENABLE_LIVE_WRITES is not set, writes to live controllers
         // (CIP or SDK online sessions) are refused before any network call.
         // Writes to virtual, L5X, and SDK offline sessions are always allowed.
-        if (capabilities is not { LiveWritesEnabled: true } && session.IsLiveController)
+        // In Echo simulation mode the flag counts as set.
+        if (capabilities is not { LiveWritesEnabled: true } && session.IsLiveController
+            && !EchoSimulation.Bypasses(session, "logix_write", Capabilities.EnvVar, tagName))
         {
             AuditLogger.LogCapabilityRefusal("logix_write", Capabilities.EnvVar);
             return new CapabilityDisabledError(
@@ -257,7 +259,8 @@ public static class WriteTagHandler
         if (dotIndex >= 0)
             baseTagName = tagName[..dotIndex];
 
-        if (session.TryGetSessionCreatedTagEntry(baseTagName, out var createdEntry))
+        if (session.TryGetSessionCreatedTagEntry(baseTagName, out var createdEntry)
+            && !EchoSimulation.Bypasses(session, "logix_write", nameof(DenyReason.CreatedByThisSession), tagName))
         {
             var denyMsg =
                 $"Write denied for tag '{tagName}': {DenyReason.CreatedByThisSession} — " +
@@ -296,7 +299,8 @@ public static class WriteTagHandler
         // sessions are not affected.
         if ((session.IsLiveController || session.WritesRequireGate) &&
             session.Service is not GatedTagService &&
-            session.WriteAllowlist is null)
+            session.WriteAllowlist is null &&
+            !EchoSimulation.Bypasses(session, "logix_write", ErrorKinds.WriteGateRequired, tagName))
         {
             var gateMessage = session.NoGateReason is { } noGate
                 ? "No write gate for this session: " + noGate + "."
@@ -327,7 +331,8 @@ public static class WriteTagHandler
         // A GatedTagService enforces the allowlist itself, after its own rules. An ungated
         // session (no project) has no gate, but an active allowlist still narrows writes.
         if (session.Service is not GatedTagService && session.WriteAllowlist is { } allowlist &&
-            allowlist.DenialMessage(tagName, gated: false) is { } allowlistMsg)
+            allowlist.DenialMessage(tagName, gated: false) is { } allowlistMsg &&
+            !EchoSimulation.Bypasses(session, "logix_write", nameof(DenyReason.NotOnAllowlist), tagName))
         {
             AuditLogger.LogGateDecision(tagName, "denied", nameof(DenyReason.NotOnAllowlist), allowlistMsg);
             AuditLogger.LogWrite(
@@ -384,12 +389,21 @@ public static class WriteTagHandler
             return new WriteTagError(pathRefused.Message, Kind: pathRefused.Kind, Tag: tagName, Hint: pathRefused.Hint);
         }
 
+        // ── Echo simulation mode: write beneath the write gate ─────────────────
+        // The gate's grants, denies, ranges and allowlist are not applied; the controller (Echo) still
+        // enforces the tag's External Access itself.
+        var writer = session.Service is GatedTagService gatedService
+                     && EchoSimulation.Bypasses(session, "logix_write", "WriteGate", tagName)
+            ? gatedService.InnerService
+            : session.Service!;
+
         string? resolvedFrom = null;
         try
         {
             // An alias is gated and written as its resolved base; the result keeps both names.
-            resolvedFrom = (session.Service as GatedTagService)?.ResolveAliasForWrite(tagName)?.ResolvedFrom;
-            await session.Service!.WriteAsync(tagName, parsedValue, ct);
+            if (ReferenceEquals(writer, session.Service))
+                resolvedFrom = (session.Service as GatedTagService)?.ResolveAliasForWrite(tagName)?.ResolvedFrom;
+            await writer.WriteAsync(tagName, parsedValue, ct);
         }
         catch (TagServiceException ex)
         {
@@ -405,7 +419,12 @@ public static class WriteTagHandler
 
             // For WriteDenied, surface an actionable hint naming the write-gate
             // designation and the L5X provenance already embedded in the message.
-            string? hint = ex.Error.Kind == TagServiceErrorKind.WriteDenied
+            // In Echo simulation mode the gate was not consulted, so the refusal came from the controller.
+            string? hint = ex.Error.Kind == TagServiceErrorKind.WriteDenied && session.ActiveEchoSimulation is not null
+                ? "Echo simulation mode is active, so lgx-mcp's own write gate did not check this write: the " +
+                  "controller (Echo) refused it itself. ErrorNotAllowed means the tag's External Access is not " +
+                  "Read/Write. Drive the input the logic reads instead, or change the value from a Studio watch table."
+                : ex.Error.Kind == TagServiceErrorKind.WriteDenied
                 ? ex.Error.Message.Contains(nameof(DenyReason.NotOnAllowlist), StringComparison.Ordinal)
                   ? $"The tag is not listed in the write allowlist file ({WriteAllowlist.EnvVar}). " +
                     (session.Service is GatedTagService { GrantsFromAllowlist: true }

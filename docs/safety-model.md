@@ -427,6 +427,9 @@ your MCP client's permission configuration (require a prompt for the write
 tool) or keep `LGX_ENABLE_LIVE_WRITES` unset. Do not rely on
 `confirmedByUser` as a security boundary.
 
+In [Echo simulation mode](#echo-simulation-mode) none of these apply to the
+proven session.
+
 A mode change on a live controller is requested but never applied: the
 server sends nothing and returns `ModeChangeNotApplied`; use Studio 5000 or
 the keyswitch.
@@ -444,6 +447,9 @@ reporting, and static interlock proof. This lets you evaluate the whole
 static-analysis and gate-derivation surface with zero risk of anything reaching
 hardware.
 
+A session proven to be a local Echo emulator, with `LGX_ECHO_SIM_MODE=1`, counts
+the switch as set: see [Echo simulation mode](#echo-simulation-mode).
+
 ## No forcing
 
 lgx-mcp has no tool to force I/O and none to change forces. No tool in either build takes a force as an
@@ -451,6 +457,90 @@ argument, and none enables, disables, adds or removes one. `logix_diagnose` cann
 (force status is not readable over CIP), so its `forces` entry always says `reported: false` and gives a
 `howToCheck`. `logix_run_test` sets test inputs by ordinary tag writes on an emulator; it does not force them.
 Forces on a controller are set and cleared only by an engineer in Logix Designer.
+
+## Echo simulation mode
+
+Echo simulation mode turns lgx-mcp into a logic-simulation test tool for a
+FactoryTalk Logix Echo emulator running on the same PC. When the connected
+controller is **proven** to be that local emulator, every lgx-mcp protection is
+off for the session. On anything not proven to be Echo, behaviour is exactly as
+described in the rest of this page.
+
+It is opt-in: set `LGX_ECHO_SIM_MODE=1` in the server's environment (only in the
+registration of a machine that runs Echo). Without it the proof is never made,
+no extra network traffic is sent, and nothing changes. The switch keeps a
+binary that is copied to another machine, one that can reach real controllers,
+exactly as safe as before.
+
+### The proof
+
+The proof is made at every `logix_connect` to a live controller (`cip`, or
+`sdk` with `sdkMode="online"`), before any connection work. It fails closed: if
+any check fails, throws or cannot be made, every protection applies.
+
+| Check | Passes when |
+|---|---|
+| `localAddress` | Every address the target resolves to is an IPv4 address that one of this PC's own network interfaces holds in the Windows `Preferred` state. A real controller can never hold an address this PC owns. Echo binds each emulated controller's address as a secondary address of the PC's own network adapter. An address in the `Duplicate` state (another device on the network holds it too) fails. |
+| `identity` | EtherNet/IP ListIdentity at that address reports a product name starting `Emulate` (for example `Emulate 5580 Controller`). It is only sent once `localAddress` has passed. |
+| `echoService` | The `FactoryTalk Logix Echo Service` Windows service is `Running`. A build that cannot query services (the no-SDK build) fails this check. |
+| `route` | The route has no hops past the emulated chassis. For `cip`, `gateway` is a bare address and `path` is exactly `1,<slot>`. For `sdk`, `sdkCommPath` is `EmulateEthernet\<ip>` or `AB_ETH-n\<ip>`, optionally followed by `\Backplane\<slot>`. |
+
+The `logix_connect` result carries the outcome as `echoSimulation`: `active`,
+the `target`, a `summary`, and every check with its `evidence`. `logix_doctor`
+reports the same as its `echoSimulation` check (`ok` when active, `warn` when the
+switch is set but the proof failed, `skipped` otherwise), and `logix_ping`
+includes it next to the capability switches. A new `logix_connect` or a
+disconnect clears it, so every session has to prove itself again.
+
+### What is off while the mode is active
+
+- **Capability switches** count as set: `LGX_ENABLE_LIVE_WRITES`,
+  `LGX_ENABLE_STUDIO_AUTOMATION`, `LGX_ENABLE_LIVE_FINALIZE` and
+  `LGX_ENABLE_CONTROLLER_DOWNLOAD`.
+- **The write gate** is bypassed for every tag. `logix_write` writes beneath the
+  `GatedTagService`, so `ProgramWritten`, `NotDesignated`,
+  `ExternalAccessNotReadWrite`, `SafetyTag`, `UnknownWriteContext`, ranges, the
+  site allowlist, `WriteGateRequired` and `CreatedByThisSession` no longer
+  refuse. `logix_run_test` does not apply its test write rules and needs no gate.
+  The policy is still derived. `logix_gate_report` still reports it, labelled
+  `hypothetical` with `enforcedBySession: false` and a `NO ENFORCED WRITE GATE`
+  disclaimer giving the reason: it shows what a write would meet on a real
+  controller.
+- **`confirmedByUser` and `confirm`** are not required for controller actions:
+  controller download, rung publishes (including `target="live"`),
+  `logix_create_routine`, `logix_finalize_edits`, the Studio pending-edit tools,
+  `logix_run_test` and `logix_controller_mode`.
+
+Before every protection it skips, the server repeats the `localAddress` check.
+If the target is no longer one of this PC's own addresses, the mode is revoked
+for the rest of the session (audited as `echo_simulation_revoked`), and every
+protection applies until a new `logix_connect` proves it again.
+
+### What stays on
+
+- **Echo's own External Access.** Logix firmware enforces each tag's and
+  member's External Access for CIP clients, so a member that is `Read Only`
+  externally is still refused, by Echo, not by lgx-mcp. Logic rewrites such
+  members every scan anyway; a logic test drives the program's inputs.
+- Request checks: tag-name syntax, whole-structure and whole-array writes,
+  NaN and Infinity values.
+- Read-modify-write refusals: a CIP write to one bit of an integer, and an SDK
+  write to a UDT member. Each would write back a whole value read moments
+  earlier and could undo a change the running logic made in between.
+- Rung-edit bookkeeping (`expectedRungText`, one pending zone per program, the
+  staged-rung buffer) and the rule that the server never changes External
+  Access.
+- The `confirm` of `logix_import_datatype`, which edits a project file, not the
+  controller.
+- The audit log.
+
+### Audit
+
+Every proof is written as `echo_simulation_proof` (active or not, with every
+check's evidence). Every skipped protection is written as
+`echo_simulation_bypass`, naming the tool and the protection. Every record
+written while the mode is active, whatever its event, carries
+`"echo_simulation": true`.
 
 ## The SDK lane: online edits and Studio automation
 
@@ -755,6 +845,12 @@ processes share one log directory, their records interleave in one file.
 | `refusal` | A `logix_read` is refused because the tag is a structure or STRING, its type is unknown, or its type does not match. | `operation` (`logix_read`); `tag`; `kind`; `error`. |
 | `tool_refused` | A state-changing tool (`logix_write`, `logix_controller_mode` with a mode, `logix_finalize_edits`, `logix_create_routine`, `logix_clear_staged`, the Studio `*_pending_edits` tools) is refused because no session is active. A refused `logix_propose_rung_edit` writes its usual `rung_edit` record with `outcome: "refused"` instead. | `operation` (the tool name); `outcome` (always `refused`); `kind` (for example `NoActiveSession`); `tag`, `program`, `routine` (whichever the call named). |
 | `capability_refusal` | A tool is refused before any network call because its opt-in switch is not set. | `operation` (the tool name, for example `logix_write`); `env_var` (the environment variable that was missing). |
+| `echo_simulation_proof` | A `logix_connect` to a live controller while `LGX_ECHO_SIM_MODE` is set. | `active`; `target`; `checks` (a list of `{name, passed, evidence}`). |
+| `echo_simulation_bypass` | A protection is skipped because the session is in Echo simulation mode. | `operation` (the tool name); `protection` (an environment variable, a deny reason such as `WriteGate` or `CreatedByThisSession`, or `confirmedByUser`/`confirm`); `target`; `subject` (the tag, when there is one). |
+| `echo_simulation_revoked` | The re-check before a skipped protection finds the target is no longer one of this PC's own addresses. | `target`; `reason`. |
+
+While Echo simulation mode is active, every record of every type also carries
+`"echo_simulation": true`.
 
 **Sessions and project files**
 

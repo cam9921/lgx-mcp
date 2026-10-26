@@ -3551,7 +3551,7 @@ public static class ProposeRungEditHandler
                 var  unchangedIndexes = new List<int>();
                 IReadOnlyList<string>? ownActual = null;
                 IReadOnlyList<string>? firstMismatchActual = null;
-                var zoneRoutines = new List<string>; // routines whose census shows the publish's pending zone
+                var zoneRoutines = new List<string>(); // routines whose census shows the publish's pending zone
 
                 foreach (var (censusRoutine, expectedTexts) in expectedByRoutine)
                 {

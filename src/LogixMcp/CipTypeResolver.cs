@@ -57,6 +57,13 @@ public sealed record CipTypeResolution(
     /// <summary>True when the type is known (atomic or structure).</summary>
     public bool IsResolved => Kind != CipTypeKind.Unresolved;
 
+    /// <summary>
+    /// For <c>STRING</c> or a user-defined string type (L5X <c>Family="StringFamily"</c>): the declared capacity
+    /// of its <c>DATA</c> array (82 for <c>STRING</c>), so the value is read as text with <c>LEN</c> checked
+    /// against it. <c>null</c> for every other type.
+    /// </summary>
+    public int? StringCapacity { get; init; }
+
     internal static CipTypeResolution Unresolved(string reason) =>
         new(CipTypeKind.Unresolved, null, CipTypeSource.None, Array.Empty<string>(), reason);
 
@@ -324,7 +331,13 @@ public sealed class CipTypeResolver
 
         var members = new List<string>();
         CollectMemberPaths(project, typeName, prefix: "", depth: 0, members);
-        return new CipTypeResolution(CipTypeKind.Structure, typeName, CipTypeSource.Project, members);
+
+        // A string type is still a structure (LEN and DATA), but it is read as text: its DATA capacity is what
+        // bounds LEN when the value is decoded.
+        return new CipTypeResolution(CipTypeKind.Structure, typeName, CipTypeSource.Project, members)
+        {
+            StringCapacity = new UdtLayout(project).StringDataLength(typeName),
+        };
     }
 
     private static void CollectMemberPaths(

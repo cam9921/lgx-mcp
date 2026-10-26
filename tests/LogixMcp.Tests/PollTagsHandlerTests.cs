@@ -270,6 +270,25 @@ public class PollTagsHandlerTests
         Assert.Equal(2.0, result.Cycles[1].Changes.Single(c => c.Tag == "Speed").Current);
     }
 
+    [Fact]
+    public async Task UserStringTypeWithAnotherName_IsWrapped()
+    {
+        var inner = new SequencedReadService(
+            new Dictionary<string, (object[] Values, string? DataType)>
+            {
+                ["Label"] = (new object[] { "a" }, "Text20"),
+            });
+        var session = new TagSessionService();
+        session.Attach(inner, isVirtual: true);
+
+        var result = Assert.IsType<PollResult>(await PollTagsHandler.ExecuteAsync(
+            new[] { "Label" }, 1, 100, session));
+
+        Assert.Equal(new[] { "value" }, result.UntrustedContent);
+        Assert.Equal("""<untrusted source="tag-value">a</untrusted>""",
+            result.Cycles[0].Changes.Single(c => c.Tag == "Label").Current);
+    }
+
     // ── Argument checks and declared-type refusals ─────────────
 
     [Theory]

@@ -395,8 +395,11 @@ USINT, UINT, UDINT, ULINT, REAL, LREAL). Consequences:
 - **Members and structures need the project.** With no project open, reading
   or writing a member path returns `TypeUnknown`; open the project so the
   member types are known.
-- A whole structure or STRING cannot be read or written as one value
-  (`StructureReadUnsupported`; read the members individually).
+- A whole structure cannot be read or written as one value
+  (`StructureReadUnsupported`; read the members individually). A `STRING` or
+  user-defined string type is the exception for reads: it is returned as its
+  text, wrapped as untrusted content, and a `LEN` outside the type's capacity is
+  refused as `StringLengthInvalid`. A STRING is never written as one value.
 - A value that does not fit the type — a fraction to a DINT, an out-of-range
   value to a SINT — is refused as `TypeMismatch` and nothing is written.
 - The write read-back compares typed values.

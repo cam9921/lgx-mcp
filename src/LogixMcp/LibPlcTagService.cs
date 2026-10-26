@@ -598,8 +598,9 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
     /// <returns>The typed value; never a partial value.</returns>
     /// <exception cref="TagServiceException">
     /// <see cref="TagServiceErrorKind.TypeUnknown"/> when unresolved,
-    /// <see cref="TagServiceErrorKind.StructureReadUnsupported"/> for a structure or STRING,
-    /// <see cref="TagServiceErrorKind.TypeMismatch"/> when the size disagrees with the type.
+    /// <see cref="TagServiceErrorKind.StructureReadUnsupported"/> for a structure that is not a string,
+    /// <see cref="TagServiceErrorKind.TypeMismatch"/> when the size disagrees with the type,
+    /// <see cref="TagServiceErrorKind.StringLengthInvalid"/> when a string's <c>LEN</c> is outside its capacity.
     /// </exception>
     internal static TagValue DecodeValue(string tagName, CipTypeResolution resolution, ITagBuffer buffer)
     {
@@ -612,6 +613,10 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
                 TagServiceErrorKind.TypeUnknown,
                 $"Cannot read '{tagName}': its data type is unknown. {resolution.Reason} Hint: {TypeUnknownHint}.",
                 tagName));
+
+        // STRING and user-defined string types are the one structure read as a value: text.
+        if (resolution.StringCapacity is int capacity)
+            return DecodeString(tagName, resolution.TypeName, capacity, buffer);
 
         if (resolution.Kind == CipTypeKind.Structure || AtomicSize(resolution.TypeName) is not int expected)
         {
@@ -648,6 +653,50 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
             _       => buffer.GetFloat64(0), // LREAL
         };
         return new TagValue(tagName, value, type);
+    }
+
+    /// <summary>
+    /// Decodes a <c>STRING</c> or user-defined string value from the tag's native buffer, by the same rules as
+    /// the SDK backend: <c>LEN</c> is the DINT at offset 0, <c>DATA</c> starts at offset 4, and the first
+    /// <c>LEN</c> bytes are decoded as Latin-1, one character per byte, so bytes 0x80-0xFF round-trip.
+    /// </summary>
+    /// <param name="tagName">Tag name for the result and error payloads.</param>
+    /// <param name="typeName">The string type's name (<c>STRING</c> or the user type), reported as the data type.</param>
+    /// <param name="capacity">The declared <c>DATA</c> capacity (82 for <c>STRING</c>).</param>
+    /// <param name="buffer">The tag's native buffer.</param>
+    /// <returns>The text, never truncated or padded.</returns>
+    /// <exception cref="TagServiceException">
+    /// <see cref="TagServiceErrorKind.TypeMismatch"/> when the controller returned fewer bytes than the type
+    /// needs; <see cref="TagServiceErrorKind.StringLengthInvalid"/> when <c>LEN</c> is negative or greater than
+    /// the capacity (the value is refused rather than cut to fit).
+    /// </exception>
+    private static TagValue DecodeString(string tagName, string typeName, int capacity, ITagBuffer buffer)
+    {
+        const int DataOffset = 4;
+
+        // The reply must be exactly the type's size: LEN and DATA, padded to a multiple of 4 (88 for STRING).
+        var expected = (DataOffset + capacity + 3) / 4 * 4;
+        var size = buffer.GetSize();
+        if (size != expected)
+            throw new TagServiceException(new TagServiceError(
+                TagServiceErrorKind.TypeMismatch,
+                $"Cannot read '{tagName}' as {typeName}: {typeName} is {expected} byte(s) (LEN, DATA[{capacity}] " +
+                $"and padding) but the controller returned {size} byte(s).",
+                tagName));
+
+        // Logix keeps LEN within the capacity, but logic can write LEN directly; refuse a value that would
+        // otherwise read past DATA or be silently shortened.
+        var length = buffer.GetInt32(0);
+        if (length < 0 || length > capacity)
+            throw new TagServiceException(new TagServiceError(
+                TagServiceErrorKind.StringLengthInvalid,
+                $"Cannot read '{tagName}': its LEN is {length}, outside the valid range 0..{capacity} for {typeName}.",
+                tagName));
+
+        var bytes = new byte[length];
+        for (var i = 0; i < length; i++)
+            bytes[i] = buffer.GetUInt8(DataOffset + i);
+        return new TagValue(tagName, System.Text.Encoding.Latin1.GetString(bytes), typeName);
     }
 
     /// <summary>

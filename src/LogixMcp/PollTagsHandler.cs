@@ -284,12 +284,12 @@ public static class PollTagsHandler
                 if (isFirstCycle || valueChanged)
                 {
                     previous.TryGetValue(result.TagName, out var oldValue);
-                    bool wrap = result.Value is string && UntrustedWrapper.IsStringFamily(result.DataType);
+                    bool wrap = result.Value is string;
                     anyWrapped |= wrap;
                     changes.Add(new TagChange(
                         Tag:      result.TagName,
-                        Previous: isFirstCycle ? null : UntrustedWrapper.WrapIfString(oldValue, result.DataType),
-                        Current:  UntrustedWrapper.WrapIfString(result.Value, result.DataType)!,
+                        Previous: isFirstCycle ? null : UntrustedWrapper.WrapIfString(oldValue),
+                        Current:  UntrustedWrapper.WrapIfString(result.Value)!,
                         DataType: result.DataType));
                 }
 

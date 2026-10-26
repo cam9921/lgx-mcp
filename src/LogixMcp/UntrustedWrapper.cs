@@ -83,24 +83,14 @@ public static class UntrustedWrapper
         Wrap(content, SourceTagValue);
 
     /// <summary>
-    /// True when <paramref name="dataType"/> is <c>STRING</c> or a STRING-family
-    /// type (e.g. <c>STRING_20</c>, <c>STRING40</c>), case-insensitively.
-    /// </summary>
-    /// <param name="dataType">Driver-reported data type, or null.</param>
-    /// <returns>Whether values of this type are free-form controller text.</returns>
-    public static bool IsStringFamily(string? dataType) =>
-        dataType is not null &&
-        dataType.StartsWith("STRING", StringComparison.OrdinalIgnoreCase);
-
-    /// <summary>
-    /// Wraps <paramref name="value"/> via <see cref="WrapTagValue"/> when it is a
-    /// string of a STRING-family type; otherwise returns it unchanged.
+    /// Wraps <paramref name="value"/> via <see cref="WrapTagValue"/> when it is a string; otherwise returns it
+    /// unchanged. Every string a tag read returns is text from a STRING or user-defined string type, whatever
+    /// that type is called, so it is wrapped without looking at the type name.
     /// </summary>
     /// <param name="value">Tag value.</param>
-    /// <param name="dataType">Driver-reported data type, or null.</param>
     /// <returns>The wrapped string, or the original value.</returns>
-    public static object? WrapIfString(object? value, string? dataType) =>
-        value is string s && IsStringFamily(dataType) ? WrapTagValue(s) : value;
+    public static object? WrapIfString(object? value) =>
+        value is string s ? WrapTagValue(s) : value;
 
     // ── Core implementation ─────────────────────────────────────────────────
 

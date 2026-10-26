@@ -671,7 +671,7 @@ public class LibPlcTagServiceTests
             Assert.Contains("size != expected", lines[i + 1], StringComparison.Ordinal);
             checkSites++;
         }
-        Assert.Equal(3, checkSites); // DecodeValue, DecodeBit and ApplyValue
+        Assert.Equal(4, checkSites); // DecodeValue, DecodeString, DecodeBit and ApplyValue
 
         var text = string.Join('\n', lines);
         Assert.DoesNotContain("ExtractTagValue", text, StringComparison.Ordinal);

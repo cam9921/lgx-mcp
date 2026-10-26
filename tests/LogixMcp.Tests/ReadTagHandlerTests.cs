@@ -52,6 +52,14 @@ public class ReadTagHandlerTests
     }
 
     [Fact]
+    public async Task UserStringTypeWithAnotherName_IsWrapped()
+    {
+        var result = Assert.IsType<ReadTagResult>(await ReadAsync("x", "Text20"));
+        Assert.Equal("""<untrusted source="tag-value">x</untrusted>""", result.Value);
+        Assert.Equal(new[] { "value" }, result.UntrustedContent);
+    }
+
+    [Fact]
     public async Task NumericAndBool_NotWrapped()
     {
         foreach (var (v, t) in new (object, string)[] { (42, "DINT"), (1.5, "REAL"), (true, "BOOL") })

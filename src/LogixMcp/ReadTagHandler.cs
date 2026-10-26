@@ -143,7 +143,9 @@ public static class ReadTagHandler
                 return new ReadTagError(refused.Message, Kind: refused.Kind, Tag: tagName, Hint: refused.Hint);
             }
             var result = await session.Service!.ReadAsync(tagName, ct);
-            if (result.Value is string str && UntrustedWrapper.IsStringFamily(result.DataType))
+            // Any text a read returns came from the controller or project (a STRING or user-defined string
+            // type, whatever its name): it is always marked untrusted.
+            if (result.Value is string str)
                 return new ReadTagResult(
                     result.TagName,
                     UntrustedWrapper.WrapTagValue(str),

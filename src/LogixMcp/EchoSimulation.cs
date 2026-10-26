@@ -90,7 +90,7 @@ public sealed class EchoSimulationEnvironment : IEchoSimulationEnvironment
     private readonly Lazy<DoctorEnvironment> _doctor = new(() => new DoctorEnvironment(null));
 
     /// <inheritdoc />
-    public bool OptedIn => Capabilities.IsTruthy(Environment.GetEnvironmentVariable(EchoSimulation.EnvVar)?.Trim());
+    public bool OptedIn => EchoSimulation.OptedInFromEnvironment();
 
     /// <inheritdoc />
     public IReadOnlyList<IPAddress> Resolve(string host) =>
@@ -155,6 +155,12 @@ public static class EchoSimulation
 {
     /// <summary>The opt-in switch. Without it the proof never runs and behaviour is unchanged.</summary>
     public const string EnvVar = "LGX_ECHO_SIM_MODE";
+
+    /// <summary>
+    /// <c>true</c> when <see cref="EnvVar"/> is set to <c>1</c>, <c>true</c> or <c>yes</c> in this process's environment.
+    /// </summary>
+    public static bool OptedInFromEnvironment() =>
+        Capabilities.IsTruthy(Environment.GetEnvironmentVariable(EnvVar)?.Trim());
 
     /// <summary>The product-name prefix every Echo controller reports in ListIdentity.</summary>
     public const string ProductPrefix = "Emulate";

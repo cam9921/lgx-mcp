@@ -1,5 +1,20 @@
 # lgx-mcp
 
+> **This is a fork.** This repository is a fork of
+> [asqi-carter/lgx-mcp](https://github.com/asqi-carter/lgx-mcp) (MIT licence, copyright ASQI), repurposed as a
+> logic-simulation test tool for our PLC tests on FactoryTalk Logix Echo. It is not maintained or endorsed by
+> ASQI. It adds two things, on the `echo-sim-mode` branch:
+>
+> - **Echo simulation mode** (`LGX_ECHO_SIM_MODE=1`, opt-in). When `logix_connect` proves the target is a Logix
+>   Echo emulator on the same PC, that session's capability switches, write gate and confirmation requirements
+>   are off, so a test can drive any input the emulated logic reads. Anything not proven to be Echo keeps every
+>   protection. See [Echo simulation mode](docs/safety-model.md#echo-simulation-mode).
+> - **STRING reads over CIP.** `logix_read` and `logix_poll` return the text of `STRING` and user-defined string
+>   types.
+>
+> Use this fork with Echo only. Its changes from upstream are listed under *Unreleased* in
+> [CHANGELOG.md](CHANGELOG.md).
+
 Version 1.0.1. Verified on FactoryTalk Logix Echo only; not verified on a physical controller. See docs/verified-on.md.
 
 MCP server for Allen-Bradley/Logix PLCs. Static `.L5X` analysis, live tag
@@ -280,6 +295,7 @@ or the `env` block of your client's config).
 | Variable | Default | Effect |
 |---|---|---|
 | `LGX_ENABLE_LIVE_WRITES` | off | `1`, `true` or `yes` allows live tag writes and controller mode requests. Without it, `logix_write` and `logix_controller_mode` are refused on live targets. Reported by `logix_ping` as `capabilities.liveWrites`. |
+| `LGX_ECHO_SIM_MODE` | off | `1`, `true` or `yes` arms Echo simulation mode (added by this fork). At each `logix_connect` to a live controller the server proves the target is a FactoryTalk Logix Echo emulator on this PC: its address is one of this PC's own, ListIdentity reports a product name starting `Emulate`, the Echo service is running, and the route has no further hops. When the proof passes, that session's capability switches, write gate and confirmation requirements are off; Echo itself still enforces each tag's External Access. A target that is not proven keeps every protection. Reported as `echoSimulation` by `logix_connect`, `logix_doctor` and `logix_ping`. See the [safety model](docs/safety-model.md#echo-simulation-mode). |
 | `LGX_CONNECT_SYNC_BUDGET_S` | `20` | Seconds an SDK-backend `logix_connect` waits before answering `status: "connecting"` (with a `connectId`, the current `phase` and `elapsedMs`) while the connect keeps running in the server. A connect that finishes within the budget returns its normal result. Clients that declare the MCP Tasks extension run the connect as a task instead and are not affected. `0` always answers `connecting` at once. Values above `600` are clamped to 600 s (logged). |
 | `LGX_WRITE_ALLOWLIST` | unset | Path to a text file listing the tags a session may write. With no project open it is the only check on a live session; with a full export it only narrows what the derived gate grants; with a partial export it is the only source of grants and the partial file's denies and ranges still apply. See the [safety model](docs/safety-model.md). |
 | `LGX_GATE_COMMAND_PREFIXES` | `Cmd_,Sim_` | Comma-separated tag-name prefixes (case-insensitive) that designate writable command tags, for example `Cmd_,Sim_,HMI_`. `*` alone designates every tag name. It relaxes naming only; logic-written, safety, External Access and consumed tags stay denied. An entry with characters outside `A-Z a-z 0-9 _` fails `logix_connect` with `GateConfigInvalid`. The Safety prefix is not configurable. `logix_connect` and `logix_gate_report` report `commandPrefixes` and `commandPrefixesSource`. See the [safety model](docs/safety-model.md). |

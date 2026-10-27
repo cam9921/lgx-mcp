@@ -929,8 +929,11 @@ public class LogixProjectSessionTests
     [Fact]
     public async Task Dispose_AfterOpen_DeletesWorkingCopy()
     {
-        // Create a real temp file so we can verify Dispose deletes it.
-        var tempFile = Path.GetTempFileName();
+        // Create a real file under the working directory so we can verify Dispose deletes it.
+        var slotDir  = Path.Combine(LogixProjectSession.WorkingDirectoryBase, $"logix-mcp-test-{Guid.NewGuid():N}");
+        var tempFile = Path.Combine(slotDir, "Project.ACD");
+        Directory.CreateDirectory(slotDir);
+        File.WriteAllText(tempFile, "dummy");
         try
         {
             var fake = new FakeLogixProject();
@@ -947,15 +950,49 @@ public class LogixProjectSessionTests
         }
         finally
         {
-            if (File.Exists(tempFile)) File.Delete(tempFile);
+            if (Directory.Exists(slotDir)) Directory.Delete(slotDir, recursive: true);
         }
+    }
+
+    [Fact]
+    public async Task Dispose_NeverDeletesAFileOutsideTheWorkingDirectory()
+    {
+        // The single-parameter constructor opens the caller's file in place (identity copier). Closing the session
+        // must leave that file alone: a hardware test once lost its bench ACD this way.
+        var callersFile = Path.GetTempFileName();
+        try
+        {
+            var fake = new FakeLogixProject();
+            var session = new LogixProjectSession((_path, _ct) => Task.FromResult<ILogixProject>(fake));
+
+            await session.OpenAsync(callersFile);
+            session.Dispose();
+
+            Assert.True(File.Exists(callersFile), "a file outside the working directory must survive Dispose");
+        }
+        finally
+        {
+            if (File.Exists(callersFile)) File.Delete(callersFile);
+        }
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void IsUnderWorkingDirectory_OnlyForPathsInsideIt(bool inside)
+    {
+        var path = inside
+            ? Path.Combine(LogixProjectSession.WorkingDirectoryBase, "slot", "Project.ACD")
+            : Path.Combine(Path.GetTempPath(), "logix-mcp-work-extra", "Project.ACD"); // a sibling, not inside
+
+        Assert.Equal(inside, LogixProjectSession.IsUnderWorkingDirectory(path));
     }
 
     [Fact]
     public async Task Dispose_AfterOpen_DeletesEmptySlotDirectory()
     {
-        // Create a dedicated temp directory with a single file inside.
-        var slotDir  = Path.Combine(Path.GetTempPath(),
+        // Create a dedicated slot directory under the working directory with a single file inside.
+        var slotDir  = Path.Combine(LogixProjectSession.WorkingDirectoryBase,
             $"logix-mcp-test-{Guid.NewGuid():N}");
         var tempFile = Path.Combine(slotDir, "Project.ACD");
         Directory.CreateDirectory(slotDir);
@@ -985,7 +1022,7 @@ public class LogixProjectSessionTests
     public async Task Dispose_AfterOpen_PreservesNonEmptySlotDirectory()
     {
         // If the slot directory still holds other files, it must NOT be deleted.
-        var slotDir   = Path.Combine(Path.GetTempPath(),
+        var slotDir   = Path.Combine(LogixProjectSession.WorkingDirectoryBase,
             $"logix-mcp-test-{Guid.NewGuid():N}");
         var tempFile  = Path.Combine(slotDir, "Project.ACD");
         var otherFile = Path.Combine(slotDir, "other.tmp");

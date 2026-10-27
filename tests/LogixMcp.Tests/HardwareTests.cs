@@ -1,7 +1,7 @@
 #if LOGIX_SDK
 // ── HardwareTests — hardware-gated reproduction tests against Echo bench ─────
 //
-// Skipped when no Echo controller is reachable at 192.0.2.30 on EtherNet/IP
+// Skipped when no Echo controller is reachable at 192.0.2.30 (or LGX_HW_ECHO_IP) on EtherNet/IP
 // port 44818 — never fails for absent hardware.
 //
 // When the Echo IS reachable but an SDK-layer member read fails (reproducing the
@@ -10,11 +10,14 @@
 //
 // Run on the bench (Echo must be running):
 //   dotnet test --filter Category=Integration
+// Under `dotnet test` the SDK also needs DOTNET_ROOT_X86 set to the x86 .NET folder (for example
+// C:\Program Files (x86)\dotnet): the test host's x64 DOTNET_ROOT otherwise reaches the 32-bit SDK
+// adapter and every SDK open or upload times out, which these tests report as a skip.
+// Bench settings: LGX_HW_ATOMIC_TAG, LGX_HW_MEMBER_TAG, LOGIX_ACD_PATH, LGX_HW_UDT and
+// LGX_HW_UDT_MEMBERS. Point LOGIX_ACD_PATH at a scratch copy of the bench ACD, never at the only copy.
 // ─────────────────────────────────────────────────────────────────────────────
 using System.Net.Sockets;
-using ILogixProjectHandle   = RockwellAutomation.LogixDesigner.ILogixProject;
 using ImportCollisionOptions = RockwellAutomation.LogixDesigner.LogixProject.ImportCollisionOptions;
-using IOperationEvent        = RockwellAutomation.LogixDesigner.Logging.IOperationEvent;
 
 // Alias System.Threading.Tasks.Task to avoid ambiguity with L5Sharp.Core.Task
 // when both namespaces are in scope.
@@ -24,7 +27,7 @@ namespace LogixMcp.Tests;
 
 /// <summary>
 /// Hardware-gated reproduction tests that require a live FactoryTalk Logix Echo
-/// controller reachable at 192.0.2.30 on EtherNet/IP port 44818.
+/// controller reachable at 192.0.2.30 (or LGX_HW_ECHO_IP) on EtherNet/IP port 44818.
 ///
 /// <para>
 /// Every test skips (never fails) when the Echo is not reachable.  When the Echo
@@ -52,14 +55,15 @@ public class HardwareTests : IDisposable
     public void Dispose() => _leaseScope.Dispose();
     // ── Well-known bench-fixed controller address ────────────
 
-    /// <summary>IP address of the Echo bench controller.</summary>
-    private const string EchoIp = "192.0.2.30";
+    /// <summary>IP address of the Echo bench controller. Override with LGX_HW_ECHO_IP for another bench.</summary>
+    private static readonly string EchoIp =
+        Environment.GetEnvironmentVariable("LGX_HW_ECHO_IP") ?? "192.0.2.30";
 
     /// <summary>
     /// Rockwell SDK comm path for the Echo controller.
     /// Matches the <c>sdkCommPath</c> used in live MCP sessions.
     /// </summary>
-    private const string EchoCommPath = @"EmulateEthernet\192.0.2.30";
+    private static readonly string EchoCommPath = $@"EmulateEthernet\{EchoIp}";
 
     /// <summary>Standard EtherNet/IP CIP TCP port.</summary>
     private const int EnipPort = 44818;
@@ -252,6 +256,7 @@ public class HardwareTests : IDisposable
 
         TagValue sdkResult;
         var sdkSvc = sessionResult.Service;
+        var uploadedProject = sessionResult.TypeProject;
         try
         {
             try
@@ -271,10 +276,12 @@ public class HardwareTests : IDisposable
         }
 
         // ── CIP path: LibPlcTagService direct EtherNet/IP read ────────────────
+        // A member's type comes from the project, as in logix_connect: the uploaded project types the CIP read.
         var cipSvc = new LibPlcTagService();
         try
         {
             await cipSvc.ConnectAsync(EchoIp, "1,0");
+            cipSvc.TypeResolver = new CipTypeResolver(uploadedProject, cipSvc.ListTagsAsync);
         }
         catch (Exception ex)
         {
@@ -381,19 +388,15 @@ public class HardwareTests : IDisposable
         Skip.If(originalMembers.Count == 0,
             $"{udtName} not found in bench project or has no members.");
 
-        // ── Create a real SDK runner (no private copy — operates on saveAs) ───
-        // Uses the public single-parameter LogixProjectSession constructor which
-        // applies identity workingCopier (static path => path), so the SDK
-        // opens saveAs directly and SaveAsync writes back to it in place.
+        // ── Create a real SDK runner, as SdkImportDatatypeRunner does ─────────
+        // Every session here uses the parameterless constructor: it opens a private copy and deletes only
+        // that copy on dispose. The single-parameter (test) constructor opens the file itself and deletes
+        // IT on dispose; the handler calls the re-export reader on the input ACD for its baseline, so that
+        // constructor deleted the bench ACD.
         Func<string, string, string, ImportCollisionOption, IReadOnlyList<string>> realSdkRunner =
             (saveAs, tempL5x, xpath, collision) =>
             {
-                using var session = new LogixProjectSession(
-                    async (path, ct) =>
-                        (ILogixProjectHandle)
-                        await RockwellAutomation.LogixDesigner.LogixProject
-                              .OpenLogixProjectAsync(path, (IOperationEvent?)null, ct)
-                              .ConfigureAwait(false));
+                using var session = new LogixProjectSession();
 
                 session.OpenAsync(saveAs, CancellationToken.None).GetAwaiter().GetResult();
                 var project = session.GetProject();
@@ -409,7 +412,8 @@ public class HardwareTests : IDisposable
 
                 project.PartialImportFromXmlFileAsync(xpath, tempL5x, sdkCollision, false)
                        .GetAwaiter().GetResult();
-                project.SaveAsync().GetAwaiter().GetResult();
+                // Save to saveAs itself (ACD, overwrite): SaveAsync would save only the private copy.
+                project.SaveAsAsync(saveAs, true, false).GetAwaiter().GetResult();
                 return Array.Empty<string>();
             };
 
@@ -421,12 +425,7 @@ public class HardwareTests : IDisposable
                 var tempExport  = Path.Combine(
                     Path.GetTempPath(), Guid.NewGuid().ToString("N") + ".L5X");
 
-                using var session = new LogixProjectSession(
-                    async (path, ct) =>
-                        (ILogixProjectHandle)
-                        await RockwellAutomation.LogixDesigner.LogixProject
-                              .OpenLogixProjectAsync(path, (IOperationEvent?)null, ct)
-                              .ConfigureAwait(false));
+                using var session = new LogixProjectSession();
                 try
                 {
                     session.OpenAsync(savedAcdPath, CancellationToken.None)
@@ -462,6 +461,10 @@ public class HardwareTests : IDisposable
                     sdkImportRunner: realSdkRunner,
                     reexportReader:  realReexportReader);
 
+                // The handler reports a refusal as a result, not an exception: put its text in the skip reason.
+                Skip.If(result is ImportDatatypeError,
+                    $"ImportDatatypeHandler.Execute returned an error: {(result as ImportDatatypeError)?.Kind}: " +
+                    (result as ImportDatatypeError)?.Error);
                 ok = Assert.IsType<ImportDatatypeResult>(result);
             }
             catch (Exception ex)
@@ -475,8 +478,9 @@ public class HardwareTests : IDisposable
             Assert.True(ok.Verified,
                 $"verified must be true after idempotent re-import of {udtName}; " +
                 $"savedTo={ok.SavedTo}");
-            // bench UDT_Recipe is expected to have exactly 10 members.
-            Assert.Equal(10, originalMembers.Count);
+            // The bench UDT_Recipe has exactly 10 members; LGX_HW_UDT_MEMBERS gives another bench UDT's count.
+            var expectedMembers = int.TryParse(Environment.GetEnvironmentVariable("LGX_HW_UDT_MEMBERS"), out var n) ? n : 10;
+            Assert.Equal(expectedMembers, originalMembers.Count);
         }
         finally
         {

@@ -87,6 +87,27 @@ public sealed class LogixProjectSession : IDisposable
         return Path.Combine(WorkingDirectoryBase, slot, Path.GetFileName(absPath));
     }
 
+    /// <summary>
+    /// True when <paramref name="path"/> lies inside <see cref="WorkingDirectoryBase"/>. The session deletes a
+    /// working copy only when this holds: a copier that returns the caller's own path (the identity copier) makes
+    /// the caller's file the "working copy", and closing the session must never delete it.
+    /// </summary>
+    /// <param name="path">The working copy's path.</param>
+    /// <returns><c>true</c> for a file under the server's working directory; <c>false</c> otherwise, or for an invalid path.</returns>
+    internal static bool IsUnderWorkingDirectory(string path)
+    {
+        try
+        {
+            var baseDir = Path.GetFullPath(WorkingDirectoryBase)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            return Path.GetFullPath(path).StartsWith(baseDir, StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return false;
+        }
+    }
+
     // ── Default copier (production) ────────────────────────────────────────────
 
     /// <summary>
@@ -767,7 +788,7 @@ public sealed class LogixProjectSession : IDisposable
             _workingCopyPath = copy;
         }
         // The old private copy carried the staged rungs; it is no longer used.
-        if (!string.Equals(oldWorking, copy, StringComparison.OrdinalIgnoreCase))
+        if (!string.Equals(oldWorking, copy, StringComparison.OrdinalIgnoreCase) && IsUnderWorkingDirectory(oldWorking))
             try { File.Delete(oldWorking); } catch { /* best effort */ }
         return null;
     }
@@ -1106,8 +1127,9 @@ public sealed class LogixProjectSession : IDisposable
 
                 // The Dispose path won't see _workingCopyPath because it was
                 // set to null before we entered the state-closed branch.
-                // Delete the working copy here so it is not orphaned.
-                try { File.Delete(workingPath); } catch { /* best effort */ }
+                // Delete the working copy here so it is not orphaned (only a copy under the working directory).
+                if (IsUnderWorkingDirectory(workingPath))
+                    try { File.Delete(workingPath); } catch { /* best effort */ }
 
                 throw new TagServiceException(new TagServiceError(
                     TagServiceErrorKind.ConnectionFailed,
@@ -1339,7 +1361,9 @@ public sealed class LogixProjectSession : IDisposable
         catch when (_faultDetail is not null) { /* best effort on a faulted session */ }
 
         // ── Best-effort cleanup of working copy ────────────────────────────────
-        if (copyToDelete is not null)
+        // Only a copy under the working directory is deleted: with the identity copier the "working copy" is the
+        // caller's own file (a test's ACD, for one), which a close must leave alone.
+        if (copyToDelete is not null && IsUnderWorkingDirectory(copyToDelete))
         {
             try
             {

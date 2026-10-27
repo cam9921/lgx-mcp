@@ -212,13 +212,24 @@ public class LibPlcTagServiceTests
 
     // ── TypeMismatch: unsupported write value ─────────────────────────────────
 
+    /// <summary>A service whose only known tag is <c>SomeTag</c>, a DINT, from the controller tag list.</summary>
+    private static async Task<LibPlcTagService> DintService()
+    {
+        var svc = new LibPlcTagService
+        {
+            TypeResolver = new CipTypeResolver(null,
+                _ => Task.FromResult<IReadOnlyList<TagInfo>>([new TagInfo("SomeTag", "DINT")])),
+        };
+        await svc.ConnectAsync("198.51.100.1", "1,0");
+        return svc;
+    }
+
     [Fact]
     public async Task WriteAsync_WithUnsupportedValueType_ThrowsTypeMismatch()
     {
-        var svc = new LibPlcTagService();
-        await svc.ConnectAsync("198.51.100.1", "1,0");
+        var svc = await DintService();
 
-        // A plain string is not a supported PLC value type.
+        // Text is a supported value only for a STRING; written to a DINT it is a type mismatch.
         // The TypeMismatch exception should be raised before any network I/O.
         var ex = await Assert.ThrowsAsync<TagServiceException>(
             () => svc.WriteAsync("SomeTag", "not-a-plc-value"));
@@ -258,8 +269,7 @@ public class LibPlcTagServiceTests
     [Fact]
     public async Task ValueConversionFailure_StillTypeMismatch()
     {
-        var svc = new LibPlcTagService();
-        await svc.ConnectAsync("198.51.100.1", "1,0");
+        var svc = await DintService();
 
         var ex = await Assert.ThrowsAsync<TagServiceException>(
             () => svc.WriteAsync("SomeTag", "not-a-plc-value"));
@@ -672,7 +682,7 @@ public class LibPlcTagServiceTests
             Assert.Contains("size != expected", lines[i + 1], StringComparison.Ordinal);
             checkSites++;
         }
-        Assert.Equal(5, checkSites); // DecodeValue, DecodeString, DecodeBit, DecodeBoolArrayElement and ApplyValue
+        Assert.Equal(6, checkSites); // DecodeValue, DecodeString, DecodeBit, DecodeBoolArrayElement, ApplyValue and ApplyString
 
         var text = string.Join('\n', lines);
         Assert.DoesNotContain("ExtractTagValue", text, StringComparison.Ordinal);

@@ -399,7 +399,10 @@ USINT, UINT, UDINT, ULINT, REAL, LREAL). Consequences:
   (`StructureReadUnsupported`; read the members individually). A `STRING` or
   user-defined string type is the exception for reads: it is returned as its
   text, wrapped as untrusted content, and a `LEN` outside the type's capacity is
-  refused as `StringLengthInvalid`. A STRING is never written as one value.
+  refused as `StringLengthInvalid`. On the `cip` backend a STRING can also be
+  written as one value: the text (`LEN` and `DATA` in one CIP write), refused
+  as `InvalidValue` when it is longer than the type's capacity or has a
+  character that does not fit in one byte.
 - A value that does not fit the type — a fraction to a DINT, an out-of-range
   value to a SINT — is refused as `TypeMismatch` and nothing is written.
 - The write read-back compares typed values.

@@ -908,10 +908,20 @@ public class WriteTagHandlerTests
 
     // ── Declared-type refusals ─────────────────────────────────
 
+    // A STRING is the one structure written whole (as text), so it passes the path check and reaches the service.
+    [Fact]
+    public async Task Write_WholeString_PassesThePathCheck_AndReachesTheService()
+    {
+        var (session, svc) = ReadTagHandlerTests.TypedSession();
+
+        await WriteTagHandler.ExecuteAsync("S1", "SPARE", session);
+
+        Assert.NotEmpty(svc.Writes);
+    }
+
     [Theory]
     [InlineData("U", "Speed", "Count")]
     [InlineData("T1", "PRE", "ACC")]
-    [InlineData("S1", "LEN", "DATA")]
     public async Task Write_WholeStructure_IsStructureWriteUnsupported_ListingTheMembers(string tag, string m1, string m2)
     {
         var (session, svc) = ReadTagHandlerTests.TypedSession();

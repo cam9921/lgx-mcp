@@ -363,7 +363,9 @@ internal static class TagPathProbe
             dims     = member.Dimensions;
         }
 
-        if (forWrite && !CipTypeResolver.IsAtomic(typeName) && MembersOf(project, typeName) is { } own)
+        // A STRING or user-defined string type is written whole, as text; any other structure is refused.
+        if (forWrite && !CipTypeResolver.IsAtomic(typeName) && new UdtLayout(project).StringDataLength(typeName) is null
+            && MembersOf(project, typeName) is { } own)
         {
             var list = string.Join(", ", own.Keys);
             return new TagPathFinding(ErrorKinds.StructureWriteUnsupported,

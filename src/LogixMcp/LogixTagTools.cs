@@ -742,6 +742,9 @@ public class LogixTagTools
     [McpServerTool(Name = "logix_write")]
     [Description(
         "Write a value to a named tag through the active logix_connect session. " +
+        "On 'cip' a STRING or user-defined string type (a tag, a member or an element) is written whole as text, " +
+        "in one CIP write; text longer than the type holds, or with a character outside one byte, is refused as " +
+        "InvalidValue. A value that looks like a number is written as that number's text ('007' becomes '7'). " +
         "Writes are gate-checked against the write-gate policy derived from the open L5X " +
         "— policy is built from the configured command prefixes (default Cmd_ and Sim_) as tag-name designations and UDT/scalar " +
         "'range N..M' bounds annotations, not hand-configured. " +

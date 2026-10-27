@@ -321,7 +321,19 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
             return;
         }
 
-        var typed = CoerceForWrite(tagName, resolution, value);
+        // A STRING or user-defined string type is written whole, as text: LEN and DATA in one CIP write.
+        // Every other type gets the value converted to it.
+        Action<ITagWriteBuffer> apply;
+        if (resolution.StringCapacity is int capacity)
+        {
+            var text = StringTextForWrite(tagName, value, resolution.TypeName!, capacity);
+            apply = buffer => ApplyString(buffer, tagName, resolution.TypeName!, capacity, text);
+        }
+        else
+        {
+            var typed = CoerceForWrite(tagName, resolution, value);
+            apply = buffer => ApplyValue(buffer, tagName, resolution.TypeName!, typed);
+        }
 
         await UseTagAsync(tagName, async tag =>
         {
@@ -329,7 +341,7 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
             // before calling Write so the library knows the correct element size).
             await SafeReadAsync(tag, tagName, cancellationToken);
 
-            ApplyValue(new LibPlcTagWriteBuffer(tag), tagName, resolution.TypeName!, typed);
+            apply(new LibPlcTagWriteBuffer(tag));
 
             try
             {
@@ -987,13 +999,70 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
     /// </summary>
     private static void ValidateValueType(string tagName, object value)
     {
-        if (value is not (bool or sbyte or byte or short or ushort or int or uint
+        if (value is not (string or bool or sbyte or byte or short or ushort or int or uint
                           or long or ulong or float or double))
             throw new TagServiceException(new TagServiceError(
                 TagServiceErrorKind.TypeMismatch,
                 $"Cannot convert value of type '{value.GetType().Name}' to a" +
-                $" supported PLC data type (BOOL, SINT..LINT, USINT..ULINT, REAL, LREAL).",
+                $" supported PLC data type (BOOL, SINT..LINT, USINT..ULINT, REAL, LREAL, STRING).",
                 tagName));
+    }
+
+    /// <summary>
+    /// The text a value stands for when it is written to a STRING: a string as it is, <c>true</c> or <c>false</c>,
+    /// or a number in its invariant form (<c>logix_write</c> parses <c>"007"</c> as the number 7, which is written
+    /// as <c>7</c>).
+    /// </summary>
+    /// <param name="value">The value to write.</param>
+    /// <returns>Its text.</returns>
+    internal static string TextOf(object value) => value switch
+    {
+        string text      => text,
+        bool flag        => flag ? "true" : "false",
+        IFormattable num => num.ToString(null, CultureInfo.InvariantCulture),
+        _                => value.ToString() ?? "",
+    };
+
+    /// <summary>
+    /// The text to write to a string type, refused when it does not fit: longer than the type's capacity, or with a
+    /// character that is not one byte (a STRING holds Latin-1 bytes, as it is read back).
+    /// </summary>
+    /// <exception cref="TagServiceException"><see cref="TagServiceErrorKind.InvalidValue"/>; nothing is written.</exception>
+    internal static string StringTextForWrite(string tagName, object value, string typeName, int capacity)
+    {
+        var text = TextOf(value);
+        if (text.Length > capacity)
+            throw new TagServiceException(new TagServiceError(TagServiceErrorKind.InvalidValue,
+                $"Cannot write '{tagName}': the text is {text.Length} characters, more than {typeName} holds " +
+                $"({capacity}). Nothing was written.", tagName));
+        var wide = text.FirstOrDefault(c => c > 0xFF);
+        if (wide != '\0')
+            throw new TagServiceException(new TagServiceError(TagServiceErrorKind.InvalidValue,
+                $"Cannot write '{tagName}': the character '{wide}' (U+{(int)wide:X4}) does not fit in one byte, and a " +
+                $"{typeName} holds one byte per character. Nothing was written.", tagName));
+        return text;
+    }
+
+    /// <summary>
+    /// Puts <paramref name="text"/> into a string type's buffer: <c>LEN</c> at offset 0, the characters at offset 4,
+    /// and the rest of <c>DATA</c> cleared. The buffer must be exactly the type's size, as when it is read.
+    /// </summary>
+    /// <exception cref="TagServiceException"><see cref="TagServiceErrorKind.TypeMismatch"/> for a buffer of the wrong size.</exception>
+    internal static void ApplyString(ITagWriteBuffer buffer, string tagName, string typeName, int capacity, string text)
+    {
+        const int DataOffset = 4;
+        var expected = (DataOffset + capacity + 3) / 4 * 4;
+        var size = buffer.GetSize();
+        if (size != expected)
+            throw new TagServiceException(new TagServiceError(
+                TagServiceErrorKind.TypeMismatch,
+                $"Cannot write '{tagName}' as {typeName}: {typeName} is {expected} byte(s) (LEN, DATA[{capacity}] " +
+                $"and padding) but the controller returned {size} byte(s). Nothing was written.",
+                tagName));
+
+        buffer.SetInt32(0, text.Length);
+        for (var i = 0; i < capacity; i++)
+            buffer.SetUInt8(DataOffset + i, i < text.Length ? (byte)text[i] : (byte)0);
     }
 
     /// <summary>Write-side view of a tag's native buffer; lets encoding be unit-tested without a live tag.</summary>

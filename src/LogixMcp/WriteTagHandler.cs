@@ -489,7 +489,8 @@ public static class WriteTagHandler
                 Status:            "ok",
                 Tag:               tagName,
                 Written:           parsedValue,
-                Observed:          readback.Value,
+                // Text read back from a STRING is controller text: marked untrusted, as in logix_read.
+                Observed:          UntrustedWrapper.WrapIfString(readback.Value)!,
                 Verified:          verified,
                 VerificationError: verificationNote,
                 DataType:          readback.DataType,
@@ -600,6 +601,10 @@ public static class WriteTagHandler
         // Integer written to an LREAL (or float vs double): compare typed numerics exactly.
         if (IsNumeric(written) && IsNumeric(observed))
             return Convert.ToDouble(written) == Convert.ToDouble(observed);
+
+        // Text read back from a STRING compares with the text the written value stands for.
+        if (observed is string text)
+            return text == LibPlcTagService.TextOf(written);
 
         // BOOL and all other types: exact equality.
         return Equals(written, observed);

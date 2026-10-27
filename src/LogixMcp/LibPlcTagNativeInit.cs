@@ -107,9 +107,26 @@ internal static class LibPlcTagNativeInit
         {
             if (_done) return;
             DoInit();
+            RaiseTimerResolution();
             _done = true;
         }
     }
+
+    // ── Timer resolution ──────────────────────────────────────────────────────
+
+    // libplctag's native threads sleep between the steps of each request, and Windows rounds a short sleep up to
+    // its timer period: 15.6 ms by default. That made every CIP read take about 62 ms against a controller that
+    // answers in under 1 ms (measured on Logix Echo). A 1 ms period for this process brings a read to a few
+    // milliseconds. It is requested once, for the life of the process; if it cannot be, reads are only slower.
+    private static void RaiseTimerResolution()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        try { _ = timeBeginPeriod(1); }
+        catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException) { }
+    }
+
+    [DllImport("winmm.dll")]
+    private static extern uint timeBeginPeriod(uint periodMs);
 
     // ── Implementation ────────────────────────────────────────────────────────
 

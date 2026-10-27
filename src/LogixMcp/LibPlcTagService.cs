@@ -32,6 +32,16 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
     /// <summary>Default per-operation timeout passed to libplctag.</summary>
     private static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(5);
 
+    // One open libplctag tag per tag name, reused by every read and write of that tag. Opening a tag (and, when
+    // it is the only one, the CIP connection with it) is what made each operation cost 120-140 ms.
+    private readonly TagHandleCache<Tag> _handles;
+
+    /// <summary>Creates the service. Call <see cref="ConnectAsync"/> before any read or write.</summary>
+    public LibPlcTagService()
+    {
+        _handles = new TagHandleCache<Tag>(OpenTagAsync, tag => tag.Dispose());
+    }
+
     /// <summary>
     /// Type resolver for this CIP session (project, then controller tag list).
     /// Set by <c>logix_connect</c>; <c>null</c> for a bare service.
@@ -61,6 +71,8 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
                 TagServiceErrorKind.ConnectionFailed,
                 "Gateway address must not be null or empty."));
 
+        // Handles opened for another controller or route must not be reused.
+        _handles.Clear();
         _gateway = gateway;
         _path    = path;
         return Task.CompletedTask;
@@ -69,6 +81,7 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
     /// <inheritdoc />
     public Task DisconnectAsync(CancellationToken cancellationToken = default)
     {
+        _handles.Clear();
         _gateway = null;
         _path    = null;
         return Task.CompletedTask;
@@ -118,12 +131,20 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
                     tagName, WordPath(arrayPath, element), element % 32, cancellationToken);
         }
 
-        using var tag = BuildTag(tagName);
-
         try
         {
-            await SafeInitializeAsync(tag, tagName, cancellationToken);
-            await SafeReadAsync(tag, tagName, cancellationToken);
+            return await UseTagAsync(tagName, async tag =>
+            {
+                await SafeReadAsync(tag, tagName, cancellationToken);
+
+                // Type the value from the project / controller tag list — never from
+                // the buffer size.
+                var resolution = typed ?? (TypeResolver is null
+                    ? CipTypeResolution.Unresolved("No type resolver is attached to this CIP session.")
+                    : await TypeResolver.ResolveAsync(tagName, cancellationToken));
+
+                return DecodeValue(tagName, resolution, new LibPlcTagBuffer(tag));
+            }, cancellationToken);
         }
         catch (TagServiceException ex) when (ex.Error.Kind == TagServiceErrorKind.WriteDenied)
         {
@@ -134,14 +155,6 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
                 : await TypeResolver.ResolveAsync(tagName, cancellationToken);
             throw RemapReadDenial(ex, tagName, denied);
         }
-
-        // Type the value from the project / controller tag list — never from
-        // the buffer size.
-        var resolution = typed ?? (TypeResolver is null
-            ? CipTypeResolution.Unresolved("No type resolver is attached to this CIP session.")
-            : await TypeResolver.ResolveAsync(tagName, cancellationToken));
-
-        return DecodeValue(tagName, resolution, new LibPlcTagBuffer(tag));
     }
 
     /// <inheritdoc />
@@ -185,41 +198,41 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
 
         var typed = CoerceForWrite(tagName, resolution, value);
 
-        using var tag = BuildTag(tagName);
+        await UseTagAsync(tagName, async tag =>
+        {
+            // Read first to populate the native tag buffer (required by libplctag
+            // before calling Write so the library knows the correct element size).
+            await SafeReadAsync(tag, tagName, cancellationToken);
 
-        await SafeInitializeAsync(tag, tagName, cancellationToken);
+            ApplyValue(new LibPlcTagWriteBuffer(tag), tagName, resolution.TypeName!, typed);
 
-        // Read first to populate the native tag buffer (required by libplctag
-        // before calling Write so the library knows the correct element size).
-        await SafeReadAsync(tag, tagName, cancellationToken);
-
-        ApplyValue(new LibPlcTagWriteBuffer(tag), tagName, resolution.TypeName!, typed);
-
-        try
-        {
-            await WithTimeoutAsync(tag.WriteAsync, cancellationToken, "write", tagName);
-        }
-        catch (TagServiceException)
-        {
-            throw;
-        }
-        catch (LibPlcTagException ex)
-        {
-            throw MapException(ex, tag.GetStatus(), tagName);
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (DllNotFoundException ex)
-        {
-            throw MapNativeLoadFailure(ex);
-        }
-        catch (Exception ex)
-        {
-            throw new TagServiceException(
-                new TagServiceError(TagServiceErrorKind.Unknown, ex.Message, tagName), ex);
-        }
+            try
+            {
+                await WithTimeoutAsync(tag.WriteAsync, cancellationToken, "write", tagName);
+            }
+            catch (TagServiceException)
+            {
+                throw;
+            }
+            catch (LibPlcTagException ex)
+            {
+                throw MapException(ex, tag.GetStatus(), tagName);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (DllNotFoundException ex)
+            {
+                throw MapNativeLoadFailure(ex);
+            }
+            catch (Exception ex)
+            {
+                throw new TagServiceException(
+                    new TagServiceError(TagServiceErrorKind.Unknown, ex.Message, tagName), ex);
+            }
+            return true;
+        }, cancellationToken);
     }
 
     /// <inheritdoc />
@@ -296,6 +309,31 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
     /// Creates a low-level <see cref="Tag"/> configured with the stored
     /// gateway/path and the Allen-Bradley EtherNet/IP protocol.
     /// </summary>
+    /// <summary>Opens (creates and initializes) the libplctag tag for <paramref name="tagName"/>.</summary>
+    private async Task<Tag> OpenTagAsync(string tagName, CancellationToken ct)
+    {
+        var tag = BuildTag(tagName);
+        try
+        {
+            await SafeInitializeAsync(tag, tagName, ct);
+            return tag;
+        }
+        catch
+        {
+            tag.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>Runs <paramref name="operation"/> on the open tag for <paramref name="tagName"/> (see <see cref="TagHandleCache{THandle}"/>).</summary>
+    private Task<T> UseTagAsync<T>(string tagName, Func<Tag, Task<T>> operation, CancellationToken ct) =>
+        _handles.UseAsync(tagName, operation, IsConnectionError, ct);
+
+    // A tag whose connection is gone (a timeout included) is closed and reopened; any other error, such as the
+    // controller refusing a write, leaves it open.
+    private static bool IsConnectionError(Exception ex) =>
+        ex is TagServiceException { Error.Kind: TagServiceErrorKind.ConnectionFailed };
+
     private Tag BuildTag(string tagName) => new Tag
     {
         Gateway  = _gateway,
@@ -510,17 +548,18 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
         if (ParentBufferReader is { } fake)
             return DecodeBoolArrayElement(tagName, bit, await fake(wordPath, ct));
 
-        using var tag = BuildTag(wordPath);
         try
         {
-            await SafeInitializeAsync(tag, wordPath, ct);
-            await SafeReadAsync(tag, wordPath, ct);
+            return await UseTagAsync(wordPath, async tag =>
+            {
+                await SafeReadAsync(tag, wordPath, ct);
+                return DecodeBoolArrayElement(tagName, bit, new LibPlcTagBuffer(tag));
+            }, ct);
         }
         catch (TagServiceException ex) when (ex.Error.Kind == TagServiceErrorKind.WriteDenied)
         {
             throw RemapReadDenial(ex, wordPath, CipTypeResolution.Unresolved("The controller refused the read."));
         }
-        return DecodeBoolArrayElement(tagName, bit, new LibPlcTagBuffer(tag));
     }
 
     /// <summary>
@@ -554,17 +593,18 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
         if (ParentBufferReader is { } fake)
             return DecodeBit(tagName, parentType, bit, await fake(parentPath, ct));
 
-        using var tag = BuildTag(parentPath);
         try
         {
-            await SafeInitializeAsync(tag, parentPath, ct);
-            await SafeReadAsync(tag, parentPath, ct);
+            return await UseTagAsync(parentPath, async tag =>
+            {
+                await SafeReadAsync(tag, parentPath, ct);
+                return DecodeBit(tagName, parentType, bit, new LibPlcTagBuffer(tag));
+            }, ct);
         }
         catch (TagServiceException ex) when (ex.Error.Kind == TagServiceErrorKind.WriteDenied)
         {
             throw RemapReadDenial(ex, parentPath, CipTypeResolution.Unresolved("The controller refused the read."));
         }
-        return DecodeBit(tagName, parentType, bit, new LibPlcTagBuffer(tag));
     }
 
     /// <summary>

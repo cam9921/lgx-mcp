@@ -231,15 +231,36 @@ public static class PollTagsHandler
                 }
             }
 
-            // Read all requested tags for this cycle.
-            var changes = new List<TagChange>();
-            var errors  = new List<TagReadError>();
+            // Read all requested tags for this cycle. On a CIP session they are read together, in one CIP
+            // request, so the cycle's values come from nearly the same moment; other backends read them in turn.
+            var changes  = new List<TagChange>();
+            var errors   = new List<TagReadError>();
+            var refusals = tags.Select(tag => TagPathProbe.ForRead(svc, tag)).ToArray();
 
-            foreach (var tag in tags)
+            Dictionary<string, TagReadOutcome>? together = null;
+            if (TagRouteResolver.Backend(svc) is LibPlcTagService)
             {
+                var readable = tags.Where((_, t) => refusals[t] is null).Distinct(StringComparer.Ordinal).ToList();
+                try
+                {
+                    together = (await TagReads.ReadTogetherAsync(svc, readable, ct))
+                        .ToDictionary(outcome => outcome.Tag, StringComparer.Ordinal);
+                }
+                catch (OperationCanceledException ex)
+                {
+                    return new PollError(
+                        $"Read failed for tags in cycle {i}: {ex.Message}",
+                        Kind: TagServiceErrorKind.Unknown.ToString(),
+                        Tag:  readable.FirstOrDefault());
+                }
+            }
+
+            for (var t = 0; t < tags.Length; t++)
+            {
+                var tag = tags[t];
                 TagValue result;
 
-                if (TagPathProbe.ForRead(svc, tag) is { } refused)
+                if (refusals[t] is { } refused)
                 {
                     errors.Add(new TagReadError(tag, $"Read failed for tag '{tag}': {refused.Message} {refused.Hint}", refused.Kind));
                     continue;
@@ -247,7 +268,9 @@ public static class PollTagsHandler
 
                 try
                 {
-                    result = await svc.ReadAsync(tag, ct);
+                    result = together is not null
+                        ? together[tag].Value ?? throw together[tag].Error!
+                        : await svc.ReadAsync(tag, ct);
                 }
                 catch (TagServiceException ex)
                 {

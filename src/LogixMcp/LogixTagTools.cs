@@ -862,6 +862,8 @@ public class LogixTagTools
         "Cycle 1 is the baseline poll: all successfully-read tags appear in 'changes' with " +
         "previous=null. Cycles 2..N report only tags whose value differs from the prior cycle. " +
         "The handler waits intervalMs milliseconds between consecutive cycles. " +
+        "On a 'cip' session each cycle's tags are read together, in one CIP request, so they describe nearly the " +
+        "same moment (not a guaranteed single scan); other backends read them one after another. " +
         "Returns a JSON object with 'tags', 'count', 'intervalMs', and 'cycles' (each cycle " +
         "contains 'cycle' number and 'changes' list with tag, previous, current, dataType). " +
         "STRING previous/current values are wrapped in <untrusted source=\"tag-value\"> and the " +

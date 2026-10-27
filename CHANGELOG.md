@@ -6,6 +6,7 @@ All notable changes to lgx-mcp. Format loosely follows
 ## [Unreleased]
 
 ### Changed
+- On a CIP session, `logix_poll` reads each cycle's tags together, and the SDK build's scripted-test tool reads each step's checks together: every libplctag read is started at once, so libplctag packs them into one CIP request and the values describe nearly the same moment, instead of being one read apart (about 130 ms before the speed-up). The types are still worked out one tag at a time, each value is decoded as a single read decodes it, two elements of one BOOL array word share one read, and each tag keeps its own error. Other backends read one tag after another, as before.
 - CIP reads and writes are much faster: on Logix Echo a read went from about 220 ms to about 14 ms and a write (read, write, read back) from about 510 ms to about 60 ms. Each tag's libplctag handle now stays open for the session and is reused (closed after 60 s unused, at most 256 open, reopened once after a lost connection), instead of being opened and closed for every operation; and the server asks Windows for a 1 ms timer period, because libplctag's native threads sleep between the steps of each request and the default 15.6 ms period made each read take about 62 ms against a controller that answers in under 1 ms.
 
 ### Added

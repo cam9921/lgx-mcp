@@ -1,4 +1,5 @@
 // ── LibPlcTagService — libplctag adapter for ITagService ─────────────────────
+using System.Buffers.Binary;
 using System.Globalization;
 using System.Numerics;
 using libplctag;
@@ -110,6 +111,130 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
     /// array element) hands its Read-Modify-Write request here instead of sending it. <c>null</c> in production.
     /// </summary>
     internal Func<CipBitWrite, CancellationToken, Task>? BitWriter { get; set; }
+
+    // ── Reading several tags together ─────────────────────────────────────────
+
+    // What one tag of a group read needs: the handle to read (the tag itself, a BOOL array's word or an
+    // integer's parent), how to decode its bytes, and how to word a refusal of the read.
+    private sealed record ReadPlan(string Handle, Func<ITagBuffer, TagValue> Decode, CipTypeResolution Denied);
+
+    /// <summary>
+    /// Reads <paramref name="tagNames"/> together, for values from nearly the same moment. The types are worked out
+    /// one tag at a time (the project lookups are not run in parallel); then every libplctag read is started at
+    /// once, so libplctag packs them into one CIP request and the controller answers them together; then each value
+    /// is decoded exactly as <see cref="ReadAsync"/> decodes it. Two elements of one BOOL array word share one read.
+    /// An alias is read on its own afterwards, by <see cref="ReadAsync"/>, which tries its name first.
+    /// </summary>
+    /// <param name="tagNames">The tag paths.</param>
+    /// <param name="cancellationToken">Cancellation token; cancellation is thrown, not captured.</param>
+    /// <returns>One outcome per requested tag, in the same order, each with the error a single read would throw.</returns>
+    public async Task<IReadOnlyList<TagReadOutcome>> ReadManyAsync(
+        IReadOnlyList<string> tagNames, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(tagNames);
+        ThrowIfNotConnected();
+
+        // 1. Plan each tag, one at a time.
+        var outcomes = new TagReadOutcome?[tagNames.Count];
+        var plans    = new ReadPlan?[tagNames.Count];
+        for (var i = 0; i < tagNames.Count; i++)
+        {
+            try
+            {
+                plans[i] = await PlanReadAsync(tagNames[i], cancellationToken);
+            }
+            catch (TagServiceException ex)
+            {
+                outcomes[i] = new TagReadOutcome(tagNames[i], null, ex);
+            }
+        }
+
+        // 2. Start every read at once, one per distinct handle.
+        var reads = plans.OfType<ReadPlan>()
+            .Select(plan => plan.Handle)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(handle => handle, handle => ReadBufferAsync(handle, cancellationToken),
+                          StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            await Task.WhenAll(reads.Values);
+        }
+        catch (Exception) when (!cancellationToken.IsCancellationRequested)
+        {
+            // Each tag gets its own read's error below.
+        }
+        cancellationToken.ThrowIfCancellationRequested();
+
+        // 3. Decode each tag, one at a time; aliases are read on their own.
+        for (var i = 0; i < tagNames.Count; i++)
+        {
+            if (outcomes[i] is not null) continue;
+            var name = tagNames[i];
+            try
+            {
+                var value = plans[i] is { } plan
+                    ? plan.Decode(await ReadOrRemapAsync(reads[plan.Handle], plan, cancellationToken))
+                    : await ReadAsync(name, cancellationToken);
+                outcomes[i] = new TagReadOutcome(name, value, null);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                outcomes[i] = new TagReadOutcome(name, null, ex);
+            }
+        }
+        return outcomes!;
+    }
+
+    // The same choices ReadPlainAsync makes, without reading: a bit of an integer reads its parent, an element of
+    // a BOOL array reads its word, anything else reads itself. Null for an alias, which is read on its own.
+    private async Task<ReadPlan?> PlanReadAsync(string tagName, CancellationToken ct)
+    {
+        TagNameValidator.ThrowIfInvalid(tagName, "Read");
+        if (Aliases?.Walk(tagName) is not null) return null;
+
+        var refused = CipTypeResolution.Unresolved("The controller refused the read.");
+        if (TryParseBitPath(tagName, out var parentPath, out var bit)
+            && await ResolveParentAsync(parentPath, ct) is { } parentType)
+        {
+            if (bit >= BitWidth(parentType))
+                throw BitOutOfRange(tagName, parentType, bit);
+            return new ReadPlan(parentPath, buffer => DecodeBit(tagName, parentType, bit, buffer), refused);
+        }
+
+        var resolution = TypeResolver is null
+            ? CipTypeResolution.Unresolved("No type resolver is attached to this CIP session.")
+            : await TypeResolver.ResolveAsync(tagName, ct);
+        if (resolution.IsBoolArrayElement && TryParseLastIndex(tagName, out var arrayPath, out var element))
+            return new ReadPlan(WordPath(arrayPath, element),
+                buffer => DecodeBoolArrayElement(tagName, element % 32, buffer), refused);
+        return new ReadPlan(tagName, buffer => DecodeValue(tagName, resolution, buffer), resolution);
+    }
+
+    // Reads one handle and copies its bytes, so the value can be decoded after the handle is free again.
+    private async Task<ITagBuffer> ReadBufferAsync(string handle, CancellationToken ct)
+    {
+        if (ParentBufferReader is { } fake)
+            return await fake(handle, ct);
+        return await UseTagAsync(handle, async tag =>
+        {
+            await SafeReadAsync(tag, handle, ct);
+            return (ITagBuffer)new BytesTagBuffer(tag.GetBuffer());
+        }, ct);
+    }
+
+    // A refused read is reported as ReadPlainAsync reports it (why the tag cannot be typed), not as a write denial.
+    private static async Task<ITagBuffer> ReadOrRemapAsync(Task<ITagBuffer> read, ReadPlan plan, CancellationToken ct)
+    {
+        try
+        {
+            return await read;
+        }
+        catch (TagServiceException ex) when (ex.Error.Kind == TagServiceErrorKind.WriteDenied)
+        {
+            ct.ThrowIfCancellationRequested();
+            throw RemapReadDenial(ex, plan.Handle, plan.Denied);
+        }
+    }
 
     private async Task<TagValue> ReadPlainAsync(string tagName, CancellationToken cancellationToken)
     {
@@ -664,6 +789,23 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
         float GetFloat32(int offset);
         /// <summary>Reads a 64-bit float.</summary>
         double GetFloat64(int offset);
+    }
+
+    // A copy of a tag's bytes (little-endian, as the controller sends them), decoded after the handle is released.
+    private sealed class BytesTagBuffer(byte[] bytes) : ITagBuffer
+    {
+        public int GetSize() => bytes.Length;
+        public bool GetBit(int offset) => (bytes[offset / 8] & (1 << (offset % 8))) != 0;
+        public sbyte GetInt8(int offset) => (sbyte)bytes[offset];
+        public byte GetUInt8(int offset) => bytes[offset];
+        public short GetInt16(int offset) => BinaryPrimitives.ReadInt16LittleEndian(bytes.AsSpan(offset));
+        public ushort GetUInt16(int offset) => BinaryPrimitives.ReadUInt16LittleEndian(bytes.AsSpan(offset));
+        public int GetInt32(int offset) => BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(offset));
+        public uint GetUInt32(int offset) => BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(offset));
+        public long GetInt64(int offset) => BinaryPrimitives.ReadInt64LittleEndian(bytes.AsSpan(offset));
+        public ulong GetUInt64(int offset) => BinaryPrimitives.ReadUInt64LittleEndian(bytes.AsSpan(offset));
+        public float GetFloat32(int offset) => BinaryPrimitives.ReadSingleLittleEndian(bytes.AsSpan(offset));
+        public double GetFloat64(int offset) => BinaryPrimitives.ReadDoubleLittleEndian(bytes.AsSpan(offset));
     }
 
     private sealed class LibPlcTagBuffer(Tag tag) : ITagBuffer

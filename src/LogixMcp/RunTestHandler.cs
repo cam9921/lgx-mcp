@@ -441,9 +441,12 @@ public static class RunTestHandler
 
             await wait(waitMs, ct).ConfigureAwait(false);
 
-            var expects = new List<RunTestExpectResult>();
-            foreach (var e in step.Expect ?? [])
-                expects.Add(await CheckAsync(e, service, ct).ConfigureAwait(false));
+            // The step's checks are read together (one CIP request on a CIP session), so they describe one moment.
+            var expectations = step.Expect ?? [];
+            var reads = (await TagReads.ReadTogetherAsync(service,
+                    expectations.Select(e => e.Tag).Distinct(StringComparer.OrdinalIgnoreCase).ToList(), ct)
+                .ConfigureAwait(false)).ToDictionary(r => r.Tag, StringComparer.OrdinalIgnoreCase);
+            var expects = expectations.Select(e => Check(e, reads[e.Tag])).ToList();
             var ok = expects.All(x => x.Verdict == "pass");
             pass &= ok;
             steps.Add(new RunTestStepResult(written, waitMs, expects, ok ? "pass" : "fail"));
@@ -499,19 +502,11 @@ public static class RunTestHandler
         return null;
     }
 
-    private static async Task<RunTestExpectResult> CheckAsync(
-        RunTestExpect e, ITagService service, CancellationToken ct)
+    private static RunTestExpectResult Check(RunTestExpect e, TagReadOutcome outcome)
     {
         var expected = Describe(e);
-        TagValue read;
-        try
-        {
-            read = await service.ReadAsync(e.Tag, ct).ConfigureAwait(false);
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            return new RunTestExpectResult(e.Tag, expected, null, "fail", $"read failed: {ex.Message}");
-        }
+        if (outcome.Value is not { } read)
+            return new RunTestExpectResult(e.Tag, expected, null, "fail", $"read failed: {outcome.Error?.Message}");
 
         var observed = read.Value;
         var ok = true;

@@ -64,6 +64,13 @@ public sealed record CipTypeResolution(
     /// </summary>
     public int? StringCapacity { get; init; }
 
+    /// <summary>
+    /// True when the path is one element of a one-dimensional BOOL array (<c>Flags[5]</c>). CIP addresses a BOOL
+    /// array by the 32-bit word that holds each element, so the element is read and written through word
+    /// <c>index / 32</c>, bit <c>index % 32</c>.
+    /// </summary>
+    public bool IsBoolArrayElement { get; init; }
+
     internal static CipTypeResolution Unresolved(string reason) =>
         new(CipTypeKind.Unresolved, null, CipTypeSource.None, Array.Empty<string>(), reason);
 
@@ -277,7 +284,13 @@ public sealed class CipTypeResolver
                         : $"'{current.Name}' has {rank} dimension(s) but {current.IndexCount} index(es) were given.");
 
             if (i == segments.Count - 1)
-                return Classify(project, typeName);
+            {
+                // An indexed BOOL of a one-dimensional array is reached through its 32-bit word.
+                var leaf = Classify(project, typeName);
+                return rank == 1 && leaf.Kind == CipTypeKind.Atomic && leaf.TypeName == "BOOL"
+                    ? leaf with { IsBoolArrayElement = true }
+                    : leaf;
+            }
 
             var next = segments[i + 1];
 

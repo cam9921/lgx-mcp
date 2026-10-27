@@ -527,9 +527,11 @@ protection applies until a new `logix_connect` proves it again.
   members every scan anyway; a logic test drives the program's inputs.
 - Request checks: tag-name syntax, whole-structure and whole-array writes,
   NaN and Infinity values.
-- Read-modify-write refusals: a CIP write to one bit of an integer, and an SDK
-  write to a UDT member. Each would write back a whole value read moments
-  earlier and could undo a change the running logic made in between.
+- The SDK's refusal of a write to a UDT member: it would write back a whole
+  value read moments earlier and could undo a change the running logic made in
+  between. A CIP write to one bit (`Tag.N`, or one element of a BOOL array) is
+  not refused: it is sent as a CIP Read-Modify-Write, which the controller
+  applies to that bit alone.
 - Rung-edit bookkeeping (`expectedRungText`, one pending zone per program, the
   staged-rung buffer) and the rule that the server never changes External
   Access.

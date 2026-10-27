@@ -312,9 +312,9 @@ public enum TagServiceErrorKind
     BitOutOfRange,
 
     /// <summary>
-    /// A write targeted one bit of an integer (<c>Tag.N</c>). Over CIP that would be a read-modify-write of
-    /// the whole integer, which can overwrite a change the running program makes between the read and the
-    /// write, so it is refused. Nothing was written. Write the whole integer, or use a BOOL member.
+    /// No longer returned by the CIP backend: a write to one bit of an integer (<c>Tag.N</c>) or to one element
+    /// of a BOOL array is sent as a CIP Read-Modify-Write, which the controller applies to that bit alone. Kept so
+    /// a client that branches on it still compiles.
     /// </summary>
     BitWriteUnsupported,
 

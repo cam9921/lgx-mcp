@@ -150,41 +150,65 @@ public class BitOfIntegerTests
     public void TryParseBitPath_NotABitPath(string path) =>
         Assert.False(LibPlcTagService.TryParseBitPath(path, out _, out _));
 
-    [Fact]
-    public async Task WriteToBitOfInteger_IsRefusedWithTypedError_AndNothingIsWritten()
+    [Theory]
+    [InlineData("Bench_Dint.5",  true,  "Bench_Dint", 5)]
+    [InlineData("Bench_Dint.31", false, "Bench_Dint", 31)]
+    public async Task WriteToBitOfInteger_SendsOneReadModifyWrite_AndNeverWritesTheWholeInteger(
+        string path, bool value, string parent, int bit)
     {
-        // The fake would hand out the parent's bytes if a read-modify-write were attempted.
+        // The fake would hand out the parent's bytes if the integer were read to be written back whole.
         var (svc, asked) = await Fake(TagListResolver("Bench_Dint", "DINT"), [0x00, 0x00, 0x00, 0x00]);
+        var written = new List<CipBitWrite>();
+        svc.BitWriter = (w, _) => { written.Add(w); return Task.CompletedTask; };
 
-        var ex = await Assert.ThrowsAsync<TagServiceException>(() => svc.WriteAsync("Bench_Dint.5", true));
+        await svc.WriteAsync(path, value);
 
-        Assert.Equal(TagServiceErrorKind.BitWriteUnsupported, ex.Error.Kind);
-        Assert.Contains("nothing was written", ex.Error.Message);
-        Assert.Empty(asked); // refused before any CIP traffic, so the whole integer is never written
+        Assert.Equal([new CipBitWrite(parent, 4, bit, value)], written);
+        Assert.Empty(asked);
+    }
+
+    [Theory]
+    [InlineData("SINT", 1)]
+    [InlineData("INT", 2)]
+    [InlineData("LINT", 8)]
+    public async Task WriteToBitOfInteger_MaskIsTheIntegersWidth(string type, int bytes)
+    {
+        var (svc, _) = await Fake(TagListResolver("Word", type), new byte[bytes]);
+        var written = new List<CipBitWrite>();
+        svc.BitWriter = (w, _) => { written.Add(w); return Task.CompletedTask; };
+
+        await svc.WriteAsync("Word.0", true);
+
+        Assert.Equal(bytes, Assert.Single(written).MaskSize);
     }
 
     [Fact]
-    public async Task WriteToOutOfRangeBit_ReturnsBitOutOfRange_NotBitWriteUnsupported()
+    public async Task WriteToOutOfRangeBit_ReturnsBitOutOfRange_AndNothingIsSent()
     {
         var (svc, asked) = await Fake(TagListResolver("Cmd_Bits", "DINT"), [0x00, 0x00, 0x00, 0x00]);
+        var written = new List<CipBitWrite>();
+        svc.BitWriter = (w, _) => { written.Add(w); return Task.CompletedTask; };
 
         var ex = await Assert.ThrowsAsync<TagServiceException>(() => svc.WriteAsync("Cmd_Bits.40", true));
 
         Assert.Equal(TagServiceErrorKind.BitOutOfRange, ex.Error.Kind);
         Assert.Contains("bits 0 to 31", ex.Error.Message);
         Assert.Empty(asked);
+        Assert.Empty(written);
     }
 
     [Fact]
-    public async Task WriteToModuleDataBit_IsRefusedWithTypedError()
+    public async Task WriteToModuleDataBit_SendsOneReadModifyWrite_TheControllerDecides()
     {
         var resolver = CipTypeResolver.ForSession(
             new StaticTypeSource(L5X.Load(RealShapePath)),
             _ => Task.FromResult<IReadOnlyList<TagInfo>>([]));
         var (svc, _) = await Fake(resolver, new byte[4]);
+        var written = new List<CipBitWrite>();
+        svc.BitWriter = (w, _) => { written.Add(w); return Task.CompletedTask; };
 
-        var ex = await Assert.ThrowsAsync<TagServiceException>(() => svc.WriteAsync("Local:1:I.Data.3", false));
+        await svc.WriteAsync("Local:1:I.Data.3", false);
 
-        Assert.Equal(TagServiceErrorKind.BitWriteUnsupported, ex.Error.Kind);
+        Assert.Equal([new CipBitWrite("Local:1:I.Data", 4, 3, false)], written);
     }
 }

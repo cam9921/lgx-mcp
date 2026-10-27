@@ -48,9 +48,16 @@ public static class ControllerNameReader
     /// carrying <see cref="BuildCipRequest"/> and the route path. An empty route sends the bare request.
     /// </summary>
     /// <param name="route">Route-path bytes from <see cref="ParseRoute"/>.</param>
-    public static byte[] BuildRoutedRequest(byte[] route)
+    public static byte[] BuildRoutedRequest(byte[] route) => BuildRoutedRequest(route, BuildCipRequest());
+
+    /// <summary>
+    /// Wraps any CIP request <paramref name="inner"/> in Unconnected_Send (0x52) along <paramref name="route"/>.
+    /// An empty route returns the bare request.
+    /// </summary>
+    /// <param name="route">Route-path bytes from <see cref="ParseRoute"/>.</param>
+    /// <param name="inner">The CIP request to deliver.</param>
+    public static byte[] BuildRoutedRequest(byte[] route, byte[] inner)
     {
-        var inner = BuildCipRequest();
         if (route.Length == 0) return inner;
         var pad = inner.Length % 2;
         var req = new List<byte> { UnconnectedSend, 0x02, 0x20, 0x06, 0x24, 0x01, 0x0A, 0xF0 };

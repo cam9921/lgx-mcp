@@ -92,6 +92,12 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
     /// </summary>
     internal Func<string, CancellationToken, Task<ITagBuffer>>? ParentBufferReader { get; set; }
 
+    /// <summary>
+    /// Test seam standing in for the CIP link on bit writes: when set, a write to one bit (<c>Tag.N</c> or a BOOL
+    /// array element) hands its Read-Modify-Write request here instead of sending it. <c>null</c> in production.
+    /// </summary>
+    internal Func<CipBitWrite, CancellationToken, Task>? BitWriter { get; set; }
+
     private async Task<TagValue> ReadPlainAsync(string tagName, CancellationToken cancellationToken)
     {
         // Tag.N / Tag.Member.N on an integer parent: read the parent and extract bit N.
@@ -100,6 +106,16 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
             var parent = await ResolveParentAsync(parentPath, cancellationToken);
             if (parent is not null)
                 return await ReadBitAsync(tagName, parentPath, bit, parent, cancellationToken);
+        }
+
+        // An element of a BOOL array: CIP addresses the array by 32-bit word, so read the word that holds it.
+        CipTypeResolution? typed = null;
+        if (TypeResolver is not null && TryParseLastIndex(tagName, out var arrayPath, out var element))
+        {
+            typed = await TypeResolver.ResolveAsync(tagName, cancellationToken);
+            if (typed.IsBoolArrayElement)
+                return await ReadBoolArrayElementAsync(
+                    tagName, WordPath(arrayPath, element), element % 32, cancellationToken);
         }
 
         using var tag = BuildTag(tagName);
@@ -121,9 +137,9 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
 
         // Type the value from the project / controller tag list — never from
         // the buffer size.
-        var resolution = TypeResolver is null
+        var resolution = typed ?? (TypeResolver is null
             ? CipTypeResolution.Unresolved("No type resolver is attached to this CIP session.")
-            : await TypeResolver.ResolveAsync(tagName, cancellationToken);
+            : await TypeResolver.ResolveAsync(tagName, cancellationToken));
 
         return DecodeValue(tagName, resolution, new LibPlcTagBuffer(tag));
     }
@@ -140,19 +156,33 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
         ValidateValueType(tagName, value);
         WriteTypeRule.RejectNonFinite(tagName, value, "LibPlcTagService");
 
-        // A bit of an integer (Tag.N) is never written: that would be a read-modify-write of the whole integer.
-        // A bit the integer does not have is BitOutOfRange (checked first), not BitWriteUnsupported.
+        // A bit of an integer (Tag.N) is written by Read-Modify-Write, so the controller changes only that bit and
+        // a change the running program makes to another bit in between is kept. A bit the integer does not have is
+        // BitOutOfRange, checked before anything is sent.
         if (TryParseBitPath(tagName, out var bitParent, out var writeBit)
             && await ResolveParentAsync(bitParent, cancellationToken) is { } bitParentType)
         {
             if (writeBit < 0 || writeBit >= BitWidth(bitParentType))
                 throw BitOutOfRange(tagName, bitParentType, writeBit);
-            throw BitWriteRefusal(tagName);
+            await WriteBitAsync(tagName,
+                new CipBitWrite(bitParent, AtomicSize(bitParentType)!.Value, writeBit, ToBit(tagName, value)),
+                cancellationToken);
+            return;
         }
 
         var resolution = TypeResolver is null
             ? CipTypeResolution.Unresolved("No type resolver is attached to this CIP session.")
             : await TypeResolver.ResolveAsync(tagName, cancellationToken);
+
+        // An element of a BOOL array is one bit of the 32-bit word that holds it: the same Read-Modify-Write.
+        if (resolution.IsBoolArrayElement && TryParseLastIndex(tagName, out var arrayPath, out var element))
+        {
+            await WriteBitAsync(tagName,
+                new CipBitWrite(WordPath(arrayPath, element), 4, element % 32, ToBit(tagName, value)),
+                cancellationToken);
+            return;
+        }
+
         var typed = CoerceForWrite(tagName, resolution, value);
 
         using var tag = BuildTag(tagName);
@@ -438,14 +468,82 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
             $"{parentType}, which has bits 0 to {BitWidth(parentType) - 1}. Nothing was read or written.",
             tagName));
 
-    /// <summary>The error for a write to one bit of an integer.</summary>
-    internal static TagServiceException BitWriteRefusal(string tagName) =>
-        new(new TagServiceError(
-            TagServiceErrorKind.BitWriteUnsupported,
-            $"Cannot write '{tagName}': it is one bit of an integer. Over CIP that is a read-modify-write of the " +
-            "whole integer, which can overwrite a change the running program makes in between, so nothing was written. " +
-            "Hint: write the whole integer, or use a BOOL member.",
-            tagName));
+    /// <summary>
+    /// The array path and index of a path whose last segment carries one numeric index (<c>Flags[37]</c> gives
+    /// <c>Flags</c> and 37); <c>false</c> for any other path.
+    /// </summary>
+    /// <param name="tagName">The tag path.</param>
+    /// <param name="arrayPath">The path up to the index.</param>
+    /// <param name="index">The index.</param>
+    /// <returns>True when the path ends with a single numeric index.</returns>
+    internal static bool TryParseLastIndex(string tagName, out string arrayPath, out int index)
+    {
+        arrayPath = "";
+        index = 0;
+        var text = tagName.Trim();
+        if (!text.EndsWith(']')) return false;
+        var open = text.LastIndexOf('[');
+        if (open <= 0) return false;
+        arrayPath = text[..open];
+        return int.TryParse(text[(open + 1)..^1], NumberStyles.None, CultureInfo.InvariantCulture, out index);
+    }
+
+    /// <summary>The 32-bit word of a BOOL array that holds element <paramref name="element"/>.</summary>
+    internal static string WordPath(string arrayPath, int element) =>
+        $"{arrayPath}[{(element / 32).ToString(CultureInfo.InvariantCulture)}]";
+
+    /// <summary>The value a bit write sets, checked by the same rule as a BOOL write: <c>true</c> or <c>false</c>.</summary>
+    private static bool ToBit(string tagName, object value)
+    {
+        WriteTypeRule.Validate(tagName, "BOOL", value);
+        return (bool)value;
+    }
+
+    /// <summary>Sends one bit write as a Read-Modify-Write, or hands it to <see cref="BitWriter"/> in tests.</summary>
+    private Task WriteBitAsync(string tagName, CipBitWrite write, CancellationToken ct) =>
+        BitWriter is { } fake
+            ? fake(write, ct)
+            : CipReadModifyWrite.WriteBitAsync(_gateway!, _path, tagName, write, ct: ct);
+
+    private async Task<TagValue> ReadBoolArrayElementAsync(string tagName, string wordPath, int bit, CancellationToken ct)
+    {
+        if (ParentBufferReader is { } fake)
+            return DecodeBoolArrayElement(tagName, bit, await fake(wordPath, ct));
+
+        using var tag = BuildTag(wordPath);
+        try
+        {
+            await SafeInitializeAsync(tag, wordPath, ct);
+            await SafeReadAsync(tag, wordPath, ct);
+        }
+        catch (TagServiceException ex) when (ex.Error.Kind == TagServiceErrorKind.WriteDenied)
+        {
+            throw RemapReadDenial(ex, wordPath, CipTypeResolution.Unresolved("The controller refused the read."));
+        }
+        return DecodeBoolArrayElement(tagName, bit, new LibPlcTagBuffer(tag));
+    }
+
+    /// <summary>
+    /// Extracts bit <paramref name="bit"/> of a BOOL array's 32-bit word as the element's BOOL value. The reply must
+    /// be exactly 4 bytes, so a wrong-width reply is never read as bits.
+    /// </summary>
+    /// <param name="tagName">The element's path, for the result and errors.</param>
+    /// <param name="bit">The bit within the word (the element index modulo 32).</param>
+    /// <param name="buffer">The word's buffer.</param>
+    /// <returns>A BOOL value.</returns>
+    /// <exception cref="TagServiceException"><see cref="TagServiceErrorKind.TypeMismatch"/> for a reply that is not 4 bytes.</exception>
+    internal static TagValue DecodeBoolArrayElement(string tagName, int bit, ITagBuffer buffer)
+    {
+        const int expected = 4;
+        var size = buffer.GetSize();
+        if (size != expected)
+            throw new TagServiceException(new TagServiceError(
+                TagServiceErrorKind.TypeMismatch,
+                $"Cannot read '{tagName}': a BOOL array word is {expected} bytes but the controller returned {size} byte(s).",
+                tagName));
+
+        return new TagValue(tagName, buffer.GetBit(bit), "BOOL");
+    }
 
     private async Task<TagValue> ReadBitAsync(string tagName, string parentPath, int bit, string parentType,
         CancellationToken ct)

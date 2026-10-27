@@ -27,18 +27,21 @@
 //                works across the protocol boundary.
 //
 //  Part 3 — SdkCipCrossBackendLiveTests (#if LOGIX_SDK, live hardware)
-//            Requires LOGIX_ACD_PATH (open SDK session) and AB_SERVER_HOST
-//            (LibPlcTagService CIP connection).  Skipped in CI; intended for
-//            operator verification on a Windows bench with Echo 5580 in RUN mode.
+//            WRITES to the controller: skipped unless LGX_HW_WRITES=1 and an Echo
+//            controller answers at LGX_HW_ECHO_IP. Connects the SDK by upload and
+//            CIP to the same address, and restores every value it writes. Intended
+//            for operator verification on a Windows bench with Echo 5580 in RUN mode.
 //
-// Run the live integration tests only:
-//   LOGIX_ACD_PATH=/path/to/Project.ACD AB_SERVER_HOST=198.51.100.x \
-//     dotnet test --filter Category=Integration
+// Run the live integration tests only (tags shown for a GW Part A bench):
+//   LGX_HW_WRITES=1 LGX_HW_ECHO_IP=198.51.100.x DOTNET_ROOT_X86="C:\Program Files (x86)\dotnet" \
+//   LGX_HW_BOOL_TAG=Program:P_Probe3.T_Running LGX_HW_REAL_TAG=none LGX_HW_DINT_TAG=Program:P_Probe3.T_BitIdx \
+//     dotnet test --filter FullyQualifiedName~SdkCipCrossBackendLiveTests
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ── SDK-only using directives (must precede namespace declaration) ─────────────
 #if LOGIX_SDK
 using System.Collections.Generic;
+using System.Net.Sockets;
 using System.Threading;
 using Google.Protobuf;
 using L5Sharp.Core;
@@ -652,197 +655,204 @@ public class SdkOnlineCipReadSandboxTests
 // ── Part 3: Live cross-backend integration tests (operator verification) ──────
 
 /// <summary>
-/// Live cross-backend round-trip tests that require both a Logix Designer SDK
-/// project session (<c>LOGIX_ACD_PATH</c>) and a reachable CIP controller
-/// (<c>AB_SERVER_HOST</c>).
+/// Live cross-backend round trips against a FactoryTalk Logix Echo controller: write a tag over the
+/// SDK online path, read it back over CIP, then write the tag's original value back.
 ///
 /// <para>
-/// All tests are skipped in CI when either environment variable is absent.
-/// Intended for operator verification on a <b>Windows bench</b> with the Echo 5580
-/// controller in RUN mode and the project already downloaded.
+/// These tests WRITE to the controller, so they are opt-in twice: they skip unless
+/// <c>LGX_HW_WRITES=1</c> and Echo answers at <c>LGX_HW_ECHO_IP</c>. Both lanes connect the way
+/// <c>logix_connect</c> does: the SDK by upload (<c>sdkMode="online"</c>), and CIP to the same
+/// address, typed from the uploaded project. Run them only on a bench project whose test inputs may
+/// be written. SDK tests under <c>dotnet test</c> also need <c>DOTNET_ROOT_X86</c> set to the x86
+/// .NET folder.
 /// </para>
 ///
 /// <para>
-/// The test verifies the three-step cross-backend agreement contract:
+/// The three-step agreement contract:
 /// <list type="number">
-///   <item>Write a tag value via the SDK-online path
+///   <item>Write a value via the SDK-online path
 ///     (<see cref="TypedSdkTagService"/> with <see cref="OperationMode.Online"/>).</item>
-///   <item>Read the same tag via the CIP lane
-///     (<see cref="LibPlcTagService"/> using libplctag).</item>
-///   <item>Assert that the two values agree — detecting any silent write failure
-///     that the SDK reports as success without reaching the controller.</item>
+///   <item>Read the same tag via the CIP lane (<see cref="LibPlcTagService"/>).</item>
+///   <item>Assert that the two agree. This detects a silent write failure that the SDK
+///     reports as success without reaching the controller.</item>
 /// </list>
 /// </para>
 ///
 /// <para>
-/// Tags used: <c>Cmd_MotorStart</c> (BOOL) and <c>Cmd_SpeedSetpoint</c> (REAL)
-/// from the Demo project.  The gate policy (Demo.L5X) grants writes to both.
+/// Tags: <c>LGX_HW_BOOL_TAG</c> (default <c>Cmd_MotorStart</c>), <c>LGX_HW_REAL_TAG</c> (default
+/// <c>Cmd_SpeedSetpoint</c>) and <c>LGX_HW_DINT_TAG</c> (no default). The defaults are the Demo
+/// project's tags. A tag that is unset with no default, or set to <c>none</c>, skips its test
+/// (Windows treats an empty environment variable as unset, so <c>none</c> is the way to say "no tag").
 /// </para>
 /// </summary>
 [Collection("LogixAcd")]
 [Trait("Category", "Integration")]
-public class SdkCipCrossBackendLiveTests
+public class SdkCipCrossBackendLiveTests : IDisposable
 {
-    // ── Well-known Demo project tag names ─────────────────────────────────────
+    // ── Bench settings ──────────────────────────────────────────────────────
 
-    /// <summary>BOOL tag granted for writes by the Demo.L5X gate policy.</summary>
-    private const string BoolTag = "Cmd_MotorStart";
+    /// <summary>Echo's address: <c>LGX_HW_ECHO_IP</c>, as in <see cref="HardwareTests"/>.</summary>
+    private static readonly string EchoIp =
+        Environment.GetEnvironmentVariable("LGX_HW_ECHO_IP") ?? "192.0.2.30";
 
-    /// <summary>REAL tag granted for writes by the Demo.L5X gate policy.</summary>
-    private const string RealTag = "Cmd_SpeedSetpoint";
+    /// <summary>BOOL tag the bench lets a test write.</summary>
+    private static readonly string? BoolTag = TagSetting("LGX_HW_BOOL_TAG", "Cmd_MotorStart");
 
-    // ── Fixture ───────────────────────────────────────────────────────────────
+    /// <summary>REAL tag the bench lets a test write.</summary>
+    private static readonly string? RealTag = TagSetting("LGX_HW_REAL_TAG", "Cmd_SpeedSetpoint");
 
-    private static readonly string L5XFixturePath =
-        Path.Combine(AppContext.BaseDirectory, "fixtures", "Demo.L5X");
+    /// <summary>DINT tag the bench lets a test write.</summary>
+    private static readonly string? DintTag = TagSetting("LGX_HW_DINT_TAG", null);
 
-    private readonly LogixAcdFixture _acdFixture;
-    private readonly string?         _cipHost;
-    private readonly string          _cipPath;
+    /// <summary>The tag a setting names: <paramref name="fallback"/> when unset, no tag when set to <c>none</c>.</summary>
+    private static string? TagSetting(string variable, string? fallback) =>
+        Environment.GetEnvironmentVariable(variable) is { Length: > 0 } value
+            ? (string.Equals(value, "none", StringComparison.OrdinalIgnoreCase) ? null : value)
+            : fallback;
 
-    /// <summary>
-    /// Initialises the test class with the shared <see cref="LogixAcdFixture"/>
-    /// and reads the CIP host from <c>AB_SERVER_HOST</c>.  Skips all tests when
-    /// either resource is unavailable.
-    /// </summary>
-    public SdkCipCrossBackendLiveTests(LogixAcdFixture acdFixture)
+    // Per-test lease file (xunit builds one instance per test): nothing here may read or write the host-wide lease.
+    private readonly IsolatedUploadLease _leaseScope = new();
+
+    /// <summary>Skips every test unless the bench has opted in to tests that write.</summary>
+    public SdkCipCrossBackendLiveTests()
     {
-        _acdFixture = acdFixture;
-        _cipHost    = Environment.GetEnvironmentVariable("AB_SERVER_HOST");
-        _cipPath    = Environment.GetEnvironmentVariable("AB_SERVER_PATH") ?? "1,0";
-
-        // Skip when the SDK project path is absent.
-        Skip.If(!acdFixture.IsAvailable, acdFixture.SkipReason);
-
-        // Skip when the CIP host is absent.
-        Skip.If(_cipHost is null,
-            "AB_SERVER_HOST environment variable is not set. " +
-            "Set AB_SERVER_HOST to the IP or hostname of the live controller " +
-            "to run cross-backend integration tests.");
+        Skip.IfNot(Environment.GetEnvironmentVariable("LGX_HW_WRITES") == "1",
+            "opt-in: these tests write to the controller. Set LGX_HW_WRITES=1 and LGX_HW_ECHO_IP on an Echo bench.");
     }
+
+    /// <inheritdoc />
+    public void Dispose() => _leaseScope.Dispose();
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /// <summary>
-    /// Opens an SDK session for the ACD project and returns a
-    /// <see cref="TypedSdkTagService"/> in <see cref="OperationMode.Online"/>
-    /// mode — the live-controller write path under test.
-    /// </summary>
-    private async Task<TypedSdkTagService> ConnectSdkAsync()
+    /// <summary>True when Echo answers on the EtherNet/IP port within 3 seconds.</summary>
+    private static async Task<bool> EchoIsReachableAsync()
     {
-        var session = new LogixProjectSession();
-        await session.OpenAsync(_acdFixture.AcdPath!);
-        var l5x = L5X.Load(L5XFixturePath);
-        return new TypedSdkTagService(session, l5x, OperationMode.Online);
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        try
+        {
+            using var client = new TcpClient();
+            await client.ConnectAsync(EchoIp, 44818, cts.Token);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     /// <summary>
-    /// Connects <see cref="LibPlcTagService"/> to the live controller and
-    /// returns it ready for CIP reads.
+    /// Connects both lanes the way <c>logix_connect</c> does: the SDK by upload, and CIP to the
+    /// same address with the uploaded project's types. Skips when Echo is not reachable or the
+    /// upload fails.
     /// </summary>
-    private async Task<LibPlcTagService> ConnectCipAsync()
+    private async Task<(SdkSessionResult Sdk, LibPlcTagService Cip)> ConnectAsync()
     {
-        var svc = new LibPlcTagService();
-        await svc.ConnectAsync(_cipHost!, _cipPath);
-        return svc;
+        Skip.IfNot(await EchoIsReachableAsync(),
+            $"Echo at {EchoIp}:44818 is not reachable. Set LGX_HW_ECHO_IP to the Echo controller's address.");
+        SdkSessionResult sdk;
+        try
+        {
+            sdk = await new SdkConnectFactory(_leaseScope.Lease).CreateFromControllerAsync($@"EmulateEthernet\{EchoIp}");
+        }
+        catch (Exception ex)
+        {
+            Skip.If(true, $"Upload from Echo at {EchoIp} failed: {ex.Message}");
+            throw;
+        }
+
+        var cip = new LibPlcTagService();
+        try
+        {
+            await cip.ConnectAsync(EchoIp, "1,0");
+            cip.TypeResolver = new CipTypeResolver(sdk.TypeProject, cip.ListTagsAsync);
+        }
+        catch
+        {
+            await sdk.Service.DisconnectAsync();
+            throw;
+        }
+        return (sdk, cip);
+    }
+
+    /// <summary>
+    /// Reads the tag over CIP, writes <paramref name="valueFor"/>(that value) over the SDK, reads it
+    /// back over CIP and checks it with <paramref name="agrees"/>. Then it writes the original value
+    /// back over the SDK, even when the check failed, and confirms the restore over CIP.
+    /// </summary>
+    private async Task RoundTripAsync(string? tag, Func<object, object> valueFor, Func<object, object, bool> agrees)
+    {
+        Skip.If(tag is null, "no tag is configured for this test on this bench");
+        var (sdk, cip) = await ConnectAsync();
+        try
+        {
+            var original = (await cip.ReadAsync(tag!)).Value;
+            var written = valueFor(original);
+            try
+            {
+                await sdk.Service.WriteAsync(tag!, written);
+                var observed = (await cip.ReadAsync(tag!)).Value;
+                Assert.True(agrees(written, observed),
+                    $"Cross-backend disagreement detected: SDK-online wrote {written} to '{tag}', " +
+                    $"but CIP read {observed} ({observed.GetType().Name}).");
+            }
+            finally
+            {
+                await sdk.Service.WriteAsync(tag!, original);
+            }
+            Assert.Equal(original, (await cip.ReadAsync(tag!)).Value);
+        }
+        finally
+        {
+            try { await cip.DisconnectAsync(); }
+            finally { await sdk.Service.DisconnectAsync(); }
+        }
     }
 
     // ── Live round-trip tests ─────────────────────────────────────────────────
 
     /// <summary>
-    /// Live BOOL cross-backend round-trip:
-    /// <list type="number">
-    ///   <item>Write <c>true</c> to <c>Cmd_MotorStart</c> via SDK-online.</item>
-    ///   <item>Read it back via CIP (<see cref="LibPlcTagService"/>).</item>
-    ///   <item>Assert that bit-0 of the CIP read is set (BOOL = 1).</item>
-    ///   <item>Restore the original value (<c>false</c>) to leave the controller clean.</item>
-    /// </list>
+    /// Live BOOL round trip: write the opposite of the tag's value via SDK-online, read it via
+    /// CIP, and restore the original value.
     /// </summary>
     [SkippableFact]
-    public async Task
-        SdkOnlineWrite_BoolTag_True_CipReadBitZeroIsSet_CrossBackendAgreement()
-    {
-        // Arrange: connect both lanes.
-        var sdkSvc = await ConnectSdkAsync();
-        var cipSvc = await ConnectCipAsync();
-
-        // Pre-condition: write false to establish a known baseline.
-        await sdkSvc.WriteAsync(BoolTag, false);
-
-        // (1) Write true via SDK-online lane.
-        await sdkSvc.WriteAsync(BoolTag, true);
-
-        // (2) Read via CIP lane (returns the BOOL as bit-0 of the raw value).
-        var cipResult = await cipSvc.ReadAsync(BoolTag);
-
-        // (3) Assert cross-backend agreement: CIP bit 0 must be set.
-        var cipValue = cipResult.Value;
-        bool cipBool = cipValue switch
-        {
-            bool   b => b,
-            int    i => (i & 1) == 1,
-            _        => throw new InvalidCastException(
-                $"Unexpected CIP value type: {cipValue.GetType().Name}"),
-        };
-        Assert.True(cipBool,
-            $"Cross-backend disagreement detected: SDK-online wrote true to " +
-            $"'{BoolTag}', but CIP read returned {cipValue} (type " +
-            $"{cipValue.GetType().Name}) — bit 0 not set.");
-
-        // Cleanup: restore false to avoid leaving the controller in a modified state.
-        await sdkSvc.WriteAsync(BoolTag, false);
-    }
+    public Task SdkOnlineWrite_BoolTag_CipReadAgrees() =>
+        RoundTripAsync(BoolTag,
+            original => !(bool)original,
+            (written, observed) => observed switch
+            {
+                bool b => b == (bool)written,
+                int  i => ((i & 1) == 1) == (bool)written,
+                _      => false,
+            });
 
     /// <summary>
-    /// Live REAL cross-backend round-trip:
-    /// <list type="number">
-    ///   <item>Write a known float to <c>Cmd_SpeedSetpoint</c> via SDK-online.</item>
-    ///   <item>Read it back via CIP (<see cref="LibPlcTagService"/>), which
-    ///     returns the 4-byte payload as a DINT (int32 bit-pattern).</item>
-    ///   <item>Reinterpret the DINT as IEEE-754 float via
-    ///     <see cref="BitConverter.Int32BitsToSingle"/>.</item>
-    ///   <item>Assert that the recovered float matches the SDK-written value.</item>
-    ///   <item>Restore the original value (0.0f) to leave the controller clean.</item>
-    /// </list>
-    ///
-    /// <para>
-    /// This is the core regression test for the silent-write-failure defect:
-    /// if the SDK write did not reach the controller, the CIP lane returns
-    /// the old value and the assertion fails.
-    /// </para>
+    /// Live REAL round trip: write a known float via SDK-online, read it via CIP, and restore the
+    /// original value. This is the core regression test for the silent-write-failure defect: if the
+    /// SDK write did not reach the controller, the CIP lane returns the old value and the check fails.
+    /// A CIP read without the tag's type returns the 4-byte payload as a DINT bit pattern, so that
+    /// form is accepted too.
     /// </summary>
     [SkippableFact]
-    public async Task
-        SdkOnlineWrite_RealTag_CipIeee754ReinterpretMatchesWrittenFloat_CrossBackendAgreement()
-    {
-        // Arrange: connect both lanes.
-        var sdkSvc = await ConnectSdkAsync();
-        var cipSvc = await ConnectCipAsync();
+    public Task SdkOnlineWrite_RealTag_CipReadAgrees() =>
+        RoundTripAsync(RealTag,
+            original => Convert.ToSingle(original) == 42.5f ? 43.5f : 42.5f,
+            (written, observed) => observed switch
+            {
+                float f => Math.Abs(f - (float)written) < 0.001f,
+                int bits => Math.Abs(BitConverter.Int32BitsToSingle(bits) - (float)written) < 0.001f,
+                _        => false,
+            });
 
-        const float writtenFloat = 42.5f;
-
-        // Pre-condition: zero the tag via SDK to ensure the test detects any write failure.
-        await sdkSvc.WriteAsync(RealTag, 0.0f);
-
-        // (1) Write 42.5f via SDK-online lane.
-        await sdkSvc.WriteAsync(RealTag, writtenFloat);
-
-        // (2) Read via CIP lane.
-        //     LibPlcTagService returns 4-byte REAL as int32 (DINT bit-pattern).
-        var cipResult = await cipSvc.ReadAsync(RealTag);
-
-        // (3) Assert cross-backend agreement via IEEE-754 reinterpretation.
-        //     This is the only check that catches silent SDK write failures.
-        float cipFloat = BitConverter.Int32BitsToSingle((int)cipResult.Value);
-        Assert.True(Math.Abs(cipFloat - writtenFloat) < 0.001f,
-            $"Cross-backend disagreement detected: SDK-online wrote {writtenFloat} to " +
-            $"'{RealTag}', but CIP read returned {cipResult.Value} (raw int32) = " +
-            $"{cipFloat}f after IEEE-754 reinterpretation. " +
-            $"The SDK write did not reach the controller.");
-
-        // Cleanup: restore 0.0f.
-        await sdkSvc.WriteAsync(RealTag, 0.0f);
-    }
+    /// <summary>
+    /// Live DINT round trip: write a value other than the tag's own (1, or 0 when it holds 1) via
+    /// SDK-online, read it via CIP, and restore the original value.
+    /// </summary>
+    [SkippableFact]
+    public Task SdkOnlineWrite_DintTag_CipReadAgrees() =>
+        RoundTripAsync(DintTag,
+            original => Convert.ToInt32(original) == 1 ? 0 : 1,
+            (written, observed) => Convert.ToInt64(observed) == Convert.ToInt64(written));
 }
 
 #endif

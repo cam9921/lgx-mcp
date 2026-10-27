@@ -53,10 +53,14 @@ public record MemberLayout(
 ///   </item>
 ///   <item>
 ///     Alignment: BOOL/SINT/USINT=1, INT/UINT=2, DINT/UDINT/REAL=4,
-///     LINT/ULINT/LREAL=4, UDT/STRING=4.
+///     LINT/ULINT/LREAL=8, STRING=4.
 ///   </item>
 ///   <item>
-///     Structures are aligned to 4 bytes and padded to a multiple of 4.
+///     Structures are aligned to their widest member: 8 bytes when they hold a
+///     LINT, ULINT or LREAL (at any depth), 4 bytes otherwise. They are padded
+///     to a multiple of that alignment. Logix Echo (5580, v38) confirmed it:
+///     with the LINT <c>Val_TimeUS</c> at a 4-byte boundary, a 4-byte rule read
+///     every later member of the GW Standard's <c>GW_MasterData</c> 4 bytes early.
 ///   </item>
 ///   <item>
 ///     BOOL members are packed into hidden SINT/DINT host members identified
@@ -89,6 +93,9 @@ public sealed class UdtLayout
     /// <summary>Per-type layout cache: typeName → (memberName → LayoutMemberInfo).</summary>
     private readonly Dictionary<string, Dictionary<string, LayoutMemberInfo>>
         _layoutCache = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Per-type alignment cache for user-defined types: typeName → 4 or 8.</summary>
+    private readonly Dictionary<string, int> _alignmentCache = new(StringComparer.OrdinalIgnoreCase);
 
     // ── Internal per-member metadata ─────────────────────────────────────────
 
@@ -394,8 +401,9 @@ public sealed class UdtLayout
         };
 
     /// <summary>
-    /// Computes the total byte size (padded to a multiple of 4) of the UDT
-    /// <paramref name="typeName"/> by simulating its member layout.
+    /// Computes the total byte size of the UDT <paramref name="typeName"/> by simulating
+    /// its member layout, padded to a multiple of its alignment (8 when it holds a
+    /// 64-bit member, otherwise 4).
     /// </summary>
     private int ComputeUdtTotalSize(string typeName)
     {
@@ -425,8 +433,8 @@ public sealed class UdtLayout
             offset += elemSize * count;
         }
 
-        // Structures are padded to a multiple of 4 bytes.
-        return AlignUp(offset, 4);
+        // Structures are padded to a multiple of their alignment (4, or 8 with a 64-bit member).
+        return AlignUp(offset, AlignmentOf(typeName));
     }
 
     /// <summary>
@@ -460,11 +468,12 @@ public sealed class UdtLayout
 
     /// <summary>
     /// Returns the natural alignment in bytes for <paramref name="typeName"/>.
-    /// Eight-byte atomic types (LINT, ULINT, LREAL) use 4-byte alignment in
-    /// Logix UDTs (matching Studio 5000 Data Monitor behaviour).
-    /// UDTs and STRING always align to 4 bytes.
+    /// Eight-byte atomic types (LINT, ULINT, LREAL) align to 8. STRING and
+    /// user-defined string types align to 4. Any other user-defined type aligns
+    /// to its widest member: 8 when it holds a 64-bit member at any depth,
+    /// otherwise 4.
     /// </summary>
-    private static int AlignmentOf(string typeName) =>
+    private int AlignmentOf(string typeName) =>
         typeName.ToUpperInvariant() switch
         {
             "BOOL"   => 1,
@@ -475,12 +484,41 @@ public sealed class UdtLayout
             "DINT"   => 4,
             "UDINT"  => 4,
             "REAL"   => 4,
-            "LINT"   => 4, // 8-byte, but Logix aligns to 4 in UDTs
-            "ULINT"  => 4,
-            "LREAL"  => 4,
+            "LINT"   => 8,
+            "ULINT"  => 8,
+            "LREAL"  => 8,
             "STRING" => 4,
-            _        => 4, // UDTs align to 4
+            _        => UdtAlignment(typeName),
         };
+
+    /// <summary>
+    /// Returns the alignment of the user-defined type <paramref name="typeName"/>:
+    /// the largest of 4 and its members' alignments. A string type, or a type the
+    /// project does not define, aligns to 4.
+    /// </summary>
+    private int UdtAlignment(string typeName)
+    {
+        if (_alignmentCache.TryGetValue(typeName, out var cached))
+            return cached;
+
+        var dt = _project.DataTypes
+            .AsEnumerable()
+            .FirstOrDefault(d => string.Equals(d.Name, typeName, StringComparison.OrdinalIgnoreCase));
+
+        var alignment = 4;
+        if (dt is not null && FindStringFamilyType(typeName) is null)
+        {
+            foreach (var member in dt.Members)
+            {
+                // A BOOL backed by a hidden host takes the host's place, so it adds nothing here.
+                if (member.Target is not null) continue;
+                alignment = Math.Max(alignment, AlignmentOf(member.DataType));
+            }
+        }
+
+        _alignmentCache[typeName] = alignment;
+        return alignment;
+    }
 
     /// <summary>
     /// Rounds <paramref name="value"/> up to the nearest multiple of

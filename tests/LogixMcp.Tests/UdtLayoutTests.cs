@@ -21,6 +21,8 @@ namespace LogixMcp.Tests;
 ///   <item>INT array element offsets (base + 2 × index).</item>
 ///   <item>BOOL members packed into a hidden DINT host by bit position.</item>
 ///   <item>Nested UDT aligned to 4 bytes with structural padding.</item>
+///   <item>LINT aligned to 8 bytes; a UDT holding one aligned and padded to 8,
+///     as in the GW Standard's <c>GW_MasterData</c>.</item>
 /// </list>
 /// </summary>
 public class UdtLayoutTests
@@ -367,5 +369,132 @@ public class UdtLayoutTests
         Assert.Equal(20, layout.StringDataLength("STRING_20"));
         Assert.Equal(82, layout.StringDataLength("STRING"));
         Assert.Null(layout.StringDataLength("StrOuterType"));
+    }
+
+    // ── 64-bit member tests ──────────────────────────────────────────────────
+
+    /// <summary>
+    /// Inline L5X with 64-bit members. <c>WideType</c> puts a LINT after 12 bytes
+    /// (a 4-byte boundary that is not an 8-byte one). <c>WideOuterType</c> nests
+    /// it after a DINT. <c>MasterLikeType</c> has the shape of the GW Standard's
+    /// <c>GW_MasterData</c>: four SINTs (one a hidden BOOL host), ten DINTs, a
+    /// LINT, a STRING and a nested count structure.
+    /// </summary>
+    private const string WideL5Xml = """
+        <?xml version="1.0" encoding="utf-8" standalone="yes"?>
+        <RSLogix5000Content SchemaRevision="1.0" SoftwareRevision="38.1"
+            TargetName="WideController" TargetType="Controller" ContainsContext="false">
+          <Controller Name="WideController" MajorRev="38" MinorRev="1"
+                      ProcessorType="Emulate 5580">
+            <DataTypes>
+              <DataType Name="WideType" Family="NoFamily" Class="User">
+                <Members>
+                  <Member Name="A" DataType="SINT" Dimension="0" Radix="Decimal" Hidden="false" />
+                  <Member Name="B" DataType="DINT" Dimension="0" Radix="Decimal" Hidden="false" />
+                  <Member Name="C" DataType="DINT" Dimension="0" Radix="Decimal" Hidden="false" />
+                  <Member Name="T" DataType="LINT" Dimension="0" Radix="Decimal" Hidden="false" />
+                  <Member Name="D" DataType="DINT" Dimension="0" Radix="Decimal" Hidden="false" />
+                </Members>
+              </DataType>
+              <DataType Name="WideOuterType" Family="NoFamily" Class="User">
+                <Members>
+                  <Member Name="X"     DataType="DINT"     Dimension="0" Radix="Decimal" Hidden="false" />
+                  <Member Name="Inner" DataType="WideType" Dimension="0" Radix="NullType" Hidden="false" />
+                  <Member Name="After" DataType="DINT"     Dimension="0" Radix="Decimal" Hidden="false" />
+                </Members>
+              </DataType>
+              <DataType Name="CountsType" Family="NoFamily" Class="User">
+                <Members>
+                  <Member Name="NextFreeArea"   DataType="DINT" Dimension="0" Radix="Decimal" Hidden="false" />
+                  <Member Name="NextFreeGroup"  DataType="DINT" Dimension="0" Radix="Decimal" Hidden="false" />
+                  <Member Name="NextFreeDevice" DataType="DINT" Dimension="0" Radix="Decimal" Hidden="false" />
+                </Members>
+              </DataType>
+              <DataType Name="MasterLikeType" Family="NoFamily" Class="User">
+                <Members>
+                  <Member Name="ZZZZZZZZZZMasterLike0" DataType="SINT" Dimension="0" Radix="Decimal" Hidden="true" />
+                  <Member Name="Cmd_Reset" DataType="BIT" Dimension="0" Radix="Decimal" Hidden="false"
+                          Target="ZZZZZZZZZZMasterLike0" BitNumber="0" />
+                  <Member Name="S1" DataType="SINT" Dimension="0" Radix="Decimal" Hidden="false" />
+                  <Member Name="S2" DataType="SINT" Dimension="0" Radix="Decimal" Hidden="false" />
+                  <Member Name="Sts_ScanPhase" DataType="SINT" Dimension="0" Radix="Decimal" Hidden="false" />
+                  <Member Name="D0" DataType="DINT" Dimension="0" Radix="Decimal" Hidden="false" />
+                  <Member Name="D1" DataType="DINT" Dimension="0" Radix="Decimal" Hidden="false" />
+                  <Member Name="D2" DataType="DINT" Dimension="0" Radix="Decimal" Hidden="false" />
+                  <Member Name="D3" DataType="DINT" Dimension="0" Radix="Decimal" Hidden="false" />
+                  <Member Name="D4" DataType="DINT" Dimension="0" Radix="Decimal" Hidden="false" />
+                  <Member Name="D5" DataType="DINT" Dimension="0" Radix="Decimal" Hidden="false" />
+                  <Member Name="D6" DataType="DINT" Dimension="0" Radix="Decimal" Hidden="false" />
+                  <Member Name="Sts_Version" DataType="DINT" Dimension="0" Radix="Decimal" Hidden="false" />
+                  <Member Name="D8" DataType="DINT" Dimension="0" Radix="Decimal" Hidden="false" />
+                  <Member Name="D9" DataType="DINT" Dimension="0" Radix="Decimal" Hidden="false" />
+                  <Member Name="Val_TimeUS" DataType="LINT" Dimension="0" Radix="Decimal" Hidden="false" />
+                  <Member Name="Cfg_Tag" DataType="STRING" Dimension="0" Radix="NullType" Hidden="false" />
+                  <Member Name="Cnt" DataType="CountsType" Dimension="0" Radix="NullType" Hidden="false" />
+                </Members>
+              </DataType>
+            </DataTypes>
+            <Modules /><AddOnInstructionDefinitions />
+            <Tags /><Programs /><Tasks />
+            <ParameterConnections /><Trends /><QuickWatchLists />
+          </Controller>
+        </RSLogix5000Content>
+        """;
+
+    /// <summary>
+    /// A LINT aligns to 8 bytes. In <c>WideType</c>: A SINT @0, B DINT @4, C DINT @8,
+    /// so the LINT goes to 16, not 12, and D follows at 24. The type is 28 bytes of
+    /// members, padded to a multiple of 8: 32.
+    /// </summary>
+    [Fact]
+    public void Lint_AlignsToEight_AndTheTypePadsToEight()
+    {
+        var layout = new UdtLayout(L5X.Parse(WideL5Xml));
+
+        var t = layout.Resolve("WideType", "T");
+        Assert.Equal(16, t.ByteOffset);
+        Assert.Equal(8, t.ByteSize);
+        Assert.Equal("LINT", t.LogixType);
+        Assert.Equal(24, layout.Resolve("WideType", "D").ByteOffset);
+        Assert.Equal(32, layout.SizeOf("WideType"));
+    }
+
+    /// <summary>
+    /// A UDT holding a LINT aligns to 8 where it is nested: in <c>WideOuterType</c>,
+    /// X DINT @0, so Inner goes to 8, not 4, its LINT to 8 + 16 = 24, and After to
+    /// 8 + 32 = 40. The outer type is 44 bytes of members, padded to 48.
+    /// </summary>
+    [Fact]
+    public void UdtHoldingALint_AlignsToEight_WhereItIsNested()
+    {
+        var layout = new UdtLayout(L5X.Parse(WideL5Xml));
+
+        Assert.Equal(8, layout.Resolve("WideOuterType", "Inner").ByteOffset);
+        Assert.Equal(24, layout.Resolve("WideOuterType", "Inner.T").ByteOffset);
+        Assert.Equal(40, layout.Resolve("WideOuterType", "After").ByteOffset);
+        Assert.Equal(48, layout.SizeOf("WideOuterType"));
+    }
+
+    /// <summary>
+    /// The GW Standard's <c>GW_MasterData</c> shape, as read on Logix Echo: four SINTs
+    /// (@0..3), ten DINTs (@4..40; <c>Sts_Version</c> @32), so the LINT
+    /// <c>Val_TimeUS</c> goes to 48, <c>Cfg_Tag</c> to 56 and <c>Cnt</c> to 144.
+    /// With 4-byte alignment for the LINT, each of these was 4 bytes early and
+    /// <c>Cnt.NextFreeDevice</c> read <c>Cnt.NextFreeGroup</c>'s value.
+    /// </summary>
+    [Fact]
+    public void MasterDataShape_MembersAfterTheLint_AreAtTheControllersOffsets()
+    {
+        var layout = new UdtLayout(L5X.Parse(WideL5Xml));
+
+        Assert.Equal(0, layout.Resolve("MasterLikeType", "Cmd_Reset").ByteOffset);
+        Assert.Equal(3, layout.Resolve("MasterLikeType", "Sts_ScanPhase").ByteOffset);
+        Assert.Equal(32, layout.Resolve("MasterLikeType", "Sts_Version").ByteOffset);
+        Assert.Equal(48, layout.Resolve("MasterLikeType", "Val_TimeUS").ByteOffset);
+        Assert.Equal(56, layout.Resolve("MasterLikeType", "Cfg_Tag").ByteOffset);
+        Assert.Equal(144, layout.Resolve("MasterLikeType", "Cnt").ByteOffset);
+        Assert.Equal(148, layout.Resolve("MasterLikeType", "Cnt.NextFreeGroup").ByteOffset);
+        Assert.Equal(152, layout.Resolve("MasterLikeType", "Cnt.NextFreeDevice").ByteOffset);
+        Assert.Equal(160, layout.SizeOf("MasterLikeType")); // 156 bytes of members, padded to 8
     }
 }

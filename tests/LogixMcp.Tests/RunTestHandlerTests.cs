@@ -222,22 +222,100 @@ public class RunTestHandlerTests
                 .Select(_ => new RunTestStep(WaitMs: 0)).ToList());
         Assert.IsType<RunTestResult>(await Run(session, [fiftySteps]));
 
-        // waitMs: default 200, clamped to [0, 10000].
-        Assert.Equal(200, RunTestHandler.ClampWaitMs(null));
-        Assert.Equal(0, RunTestHandler.ClampWaitMs(-5));
-        Assert.Equal(10_000, RunTestHandler.ClampWaitMs(60_000));
-        Assert.Equal(1234, RunTestHandler.ClampWaitMs(1234));
-
+        // waitMs: default 200; any wait up to MaxWaitMs runs exactly as asked, never shortened.
         var waits = new List<int>();
         var wcase = new RunTestCase("waits", Steps:
         [
-            new RunTestStep(),                  // default
-            new RunTestStep(WaitMs: -1),        // clamped up
-            new RunTestStep(WaitMs: 99_999),    // clamped down
+            new RunTestStep(),                                    // default
+            new RunTestStep(WaitMs: 0),
+            new RunTestStep(WaitMs: 15_000),                      // over the old 10 s cap
+            new RunTestStep(WaitMs: RunTestHandler.MaxWaitMs),
         ]);
         var res = Assert.IsType<RunTestResult>(await Run(session, [wcase], waits: waits));
-        Assert.Equal([200, 0, 10_000], waits);
-        Assert.Equal([200, 0, 10_000], res.Cases[0].Steps.Select(s => s.WaitMs).ToArray());
+        Assert.Equal([200, 0, 15_000, RunTestHandler.MaxWaitMs], waits);
+        Assert.Equal([200, 0, 15_000, RunTestHandler.MaxWaitMs], res.Cases[0].Steps.Select(s => s.WaitMs).ToArray());
+    }
+
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(RunTestHandler.MaxWaitMs + 1)]
+    public async Task WaitOutOfRange_RefusesTheRun_BeforeAnyWrite_NamingStepAndLimit(int waitMs)
+    {
+        var (session, svc) = Session();
+        var c = new RunTestCase("long", Steps:
+        [
+            new RunTestStep(Set: [new RunTestSet("Cmd_Start", J("true"))], WaitMs: 0),
+            new RunTestStep(WaitMs: 100),
+            new RunTestStep(WaitMs: waitMs),
+        ]);
+
+        var err = Assert.IsType<RunTestError>(await Run(session, [c]));
+
+        Assert.Equal("LimitExceeded", err.Kind);
+        Assert.Contains("Case 'long' step 3", err.Error);
+        Assert.Contains("300,000 ms", err.Error);
+        Assert.Empty(svc.Writes);
+    }
+
+    // ── keep ──────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task Keep_LeavesTheTagWritten_AndListsItsOriginalValue()
+    {
+        var (session, svc) = Session();
+        var c = new RunTestCase("setup only", Steps:
+        [
+            new RunTestStep(Set: [new RunTestSet("Cmd_Start", J("true")), new RunTestSet("Speed", J("42"))], WaitMs: 0),
+        ], Keep: ["Cmd_Start"]);
+
+        var res = Assert.IsType<RunTestResult>(await Run(session, [c]));
+
+        var kept = Assert.Single(res.Cases[0].Kept!);
+        Assert.Equal("Cmd_Start", kept.Tag);
+        Assert.Equal(false, kept.OriginalValue);
+        Assert.Equal("BOOL", kept.DataType);
+        Assert.Equal(kept, Assert.Single(res.Kept!));
+        Assert.Equal(true, (await svc.ReadAsync("Cmd_Start")).Value);           // kept as written
+        Assert.Equal(5, (await svc.ReadAsync("Speed")).Value);                   // restored
+        Assert.Equal(["Speed"], res.Restored!.Select(r => r.Tag).ToArray());
+        Assert.Equal("pass", res.Overall);
+    }
+
+    [Fact]
+    public async Task Keep_TagTheCaseNeverSets_IsRefused_BeforeAnyWrite()
+    {
+        var (session, svc) = Session();
+        var c = new RunTestCase("c", Steps: [new RunTestStep(Set: [new RunTestSet("Cmd_Start", J("true"))], WaitMs: 0)],
+            Keep: ["Speed"]);
+
+        var err = Assert.IsType<RunTestError>(await Run(session, [c]));
+
+        Assert.Equal("InvalidTest", err.Kind);
+        Assert.Contains("keeps 'Speed', which it never sets", err.Error);
+        Assert.Empty(svc.Writes);
+    }
+
+    // ── Range checks ──────────────────────────────────────────────────────────
+
+    [Theory]
+    [InlineData("true", 1.0, 1.0, "pass")]
+    [InlineData("true", 0.0, 0.0, "fail")]
+    [InlineData("false", 0.0, 0.0, "pass")]
+    [InlineData("false", 0.0, 1.0, "pass")]
+    public async Task RangeCheckOnBool_IsEvaluatedAsZeroOrOne(string value, double min, double max, string verdict)
+    {
+        var (session, _) = Session();
+        var c = new RunTestCase("bool range", Steps:
+        [
+            new RunTestStep(Set: [new RunTestSet("Cmd_Start", J(value))], WaitMs: 0,
+                Expect: [new RunTestExpect("Motor_Run", Min: min, Max: max)]),
+        ]);
+
+        var res = Assert.IsType<RunTestResult>(await Run(session, [c]));
+
+        var check = res.Cases[0].Steps[0].Expect[0];
+        Assert.Equal(verdict, check.Verdict);
+        Assert.Null(check.Error);
     }
 
     // ── Test write rules ─────────────────────────────────────────
@@ -428,7 +506,7 @@ public class RunTestHandlerTests
                     new RunTestExpect("Speed", EqualsValue: J("6")),    // wrong value
                     new RunTestExpect("Speed", Min: 6),                 // below min
                     new RunTestExpect("Speed", Max: 4),                 // above max
-                    new RunTestExpect("Motor_Run", Min: 0),             // non-numeric: cannot satisfy a bound
+                    new RunTestExpect("Motor_Run", Min: 1),             // a BOOL counts as 0 or 1: false is below 1
                     new RunTestExpect("Speed"),                         // no expectation given
                 ]),
                 new RunTestStep(WaitMs: 0, Expect: [new RunTestExpect("Speed", EqualsValue: J("5"))]),

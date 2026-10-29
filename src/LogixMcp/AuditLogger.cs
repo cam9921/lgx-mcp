@@ -1457,6 +1457,27 @@ public static class AuditLogger
     }
 
     /// <summary>
+    /// Appends one <c>test_kept</c> audit event for a tag a <c>logix_run_test</c> case left as written (its
+    /// <c>keep</c> list) instead of restoring, with the value it held before the case.
+    /// </summary>
+    /// <param name="caseName">The case that kept the tag.</param>
+    /// <param name="tag">The kept tag.</param>
+    /// <param name="originalValue">Its value before the case.</param>
+    /// <param name="dataType">Its data type.</param>
+    public static void LogTestKept(string caseName, string tag, object? originalValue, string? dataType)
+    {
+        Append(new
+        {
+            ts             = Timestamp(),
+            @event         = "test_kept",
+            @case          = caseName,
+            tag,
+            original_value = originalValue,
+            data_type      = dataType,
+        });
+    }
+
+    /// <summary>
     /// Appends an <c>edits_cancelled</c> audit event for one
     /// <c>logix_cancel_pending_edits</c> call — the Studio-GUI-driven
     /// cancellation of a routine's pending edit zone.

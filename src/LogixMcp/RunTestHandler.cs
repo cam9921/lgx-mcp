@@ -24,7 +24,7 @@ public sealed record RunTestExpect(
 
 /// <summary>One step of a test case: set tags, wait, then check expectations.</summary>
 /// <param name="Set">Tags to write at the start of the step.</param>
-/// <param name="WaitMs">Settle time after the writes; default 200, clamped to [0, 10000].</param>
+/// <param name="WaitMs">Settle time after the writes; default 200, at most <see cref="RunTestHandler.MaxWaitMs"/> (a longer or negative wait refuses the run before anything is written).</param>
 /// <param name="Expect">Assertions evaluated after the wait.</param>
 public sealed record RunTestStep(
     [property: JsonPropertyName("set")]    IReadOnlyList<RunTestSet>?    Set    = null,
@@ -35,10 +35,15 @@ public sealed record RunTestStep(
 /// <param name="Name">Case name reported in the result.</param>
 /// <param name="Setup">Tags written once before the first step.</param>
 /// <param name="Steps">Ordered steps.</param>
+/// <param name="Keep">
+/// Tags the case sets that are left as written at the end instead of restored, so a test split over several calls
+/// keeps its conditions. The result lists each one's original value for a later restore.
+/// </param>
 public sealed record RunTestCase(
     [property: JsonPropertyName("name")]  string                      Name,
     [property: JsonPropertyName("setup")] IReadOnlyList<RunTestSet>?  Setup = null,
-    [property: JsonPropertyName("steps")] IReadOnlyList<RunTestStep>? Steps = null);
+    [property: JsonPropertyName("steps")] IReadOnlyList<RunTestStep>? Steps = null,
+    [property: JsonPropertyName("keep")]  IReadOnlyList<string>?      Keep  = null);
 
 // ── Result types ──────────────────────────────────────────────────────────────
 
@@ -92,6 +97,15 @@ public sealed record RunTestRestoreEntry(
     [property: JsonPropertyName("confirmed")] bool    Confirmed,
     [property: JsonPropertyName("error")]     string? Error = null);
 
+/// <summary>One tag a case left as written (<c>keep</c>), with what to write to put it back.</summary>
+/// <param name="Tag">The kept tag.</param>
+/// <param name="OriginalValue">The value it held before the case.</param>
+/// <param name="DataType">Its data type.</param>
+public sealed record RunTestKeptEntry(
+    [property: JsonPropertyName("tag")]           string  Tag,
+    [property: JsonPropertyName("originalValue")] object? OriginalValue,
+    [property: JsonPropertyName("dataType")]      string? DataType);
+
 /// <summary>One executed case.</summary>
 /// <param name="Name">Case name.</param>
 /// <param name="Result"><c>pass</c> or <c>fail</c>.</param>
@@ -99,7 +113,8 @@ public sealed record RunTestRestoreEntry(
 /// <param name="DurationMs">Elapsed milliseconds.</param>
 /// <param name="Error">Setup write failure text, when setup failed.</param>
 /// <param name="OrdinaryWriteDenied">Tags this case sets that ordinary <c>logix_write</c> would deny (empty when none).</param>
-/// <param name="Restored">Snapshot restore outcome for every tag the case sets; runs even when the case fails or throws.</param>
+/// <param name="Restored">Snapshot restore outcome for every tag the case sets and does not keep; runs even when the case fails or throws.</param>
+/// <param name="Kept">Each tag the case kept as written, with its original value.</param>
 public sealed record RunTestCaseResult(
     [property: JsonPropertyName("name")]       string                          Name,
     [property: JsonPropertyName("result")]     string                          Result,
@@ -107,7 +122,8 @@ public sealed record RunTestCaseResult(
     [property: JsonPropertyName("durationMs")] long                            DurationMs,
     [property: JsonPropertyName("error")]      string?                         Error = null,
     [property: JsonPropertyName("ordinaryWriteDenied")] IReadOnlyList<TestWriteDisclosure>? OrdinaryWriteDenied = null,
-    [property: JsonPropertyName("restored")] IReadOnlyList<RunTestRestoreEntry>? Restored = null);
+    [property: JsonPropertyName("restored")] IReadOnlyList<RunTestRestoreEntry>? Restored = null,
+    [property: JsonPropertyName("kept")]     IReadOnlyList<RunTestKeptEntry>?    Kept = null);
 
 /// <summary>Result of a <c>logix_run_test</c> call that passed every gate.</summary>
 /// <param name="Overall"><c>pass</c>, <c>fail</c>, or <c>restore_failed</c> when any restore was not confirmed (takes precedence over <c>fail</c>).</param>
@@ -116,13 +132,15 @@ public sealed record RunTestCaseResult(
 /// <param name="DurationMs">Total elapsed milliseconds.</param>
 /// <param name="Restored">Every restore entry of every case, in run order.</param>
 /// <param name="RestoreFailedTags">Tags whose restore was not confirmed (empty when all confirmed).</param>
+/// <param name="Kept">Every kept tag of every case, in run order, with its original value.</param>
 public sealed record RunTestResult(
     [property: JsonPropertyName("overall")]     string                         Overall,
     [property: JsonPropertyName("productName")] string                         ProductName,
     [property: JsonPropertyName("cases")]       IReadOnlyList<RunTestCaseResult> Cases,
     [property: JsonPropertyName("durationMs")]  long                           DurationMs,
     [property: JsonPropertyName("restored")]    IReadOnlyList<RunTestRestoreEntry>? Restored = null,
-    [property: JsonPropertyName("restoreFailedTags")] IReadOnlyList<string>? RestoreFailedTags = null);
+    [property: JsonPropertyName("restoreFailedTags")] IReadOnlyList<string>? RestoreFailedTags = null,
+    [property: JsonPropertyName("kept")]        IReadOnlyList<RunTestKeptEntry>? Kept = null);
 
 // ── RunTestHandler ────────────────────────────────────────────────────────────
 
@@ -156,19 +174,56 @@ public static class RunTestHandler
     /// <summary>Default <c>waitMs</c> when a step omits it.</summary>
     public const int DefaultWaitMs = 200;
 
-    /// <summary>Upper clamp for <c>waitMs</c>.</summary>
-    public const int MaxWaitMs = 10_000;
+    /// <summary>
+    /// Longest <c>waitMs</c> a step may ask for. A longer one refuses the run before anything is written; a wait is
+    /// never shortened. A run longer than the sync budget keeps going in the server (see <see cref="RunTestJobs"/>).
+    /// </summary>
+    public const int MaxWaitMs = 300_000;
 
     /// <summary>Reads the ListIdentity of <c>host</c>; overridable so tests need no network.</summary>
     /// <param name="host">Controller host.</param>
     /// <param name="ct">Cancellation token.</param>
     public delegate Task<EmulatorIdentityInfo> IdentityReader(string host, CancellationToken ct);
 
-    /// <summary>Clamps a requested wait to <c>[0, MaxWaitMs]</c>, defaulting to <see cref="DefaultWaitMs"/>.</summary>
+    /// <summary>The wait a step runs: the one it asks for, or <see cref="DefaultWaitMs"/> when it asks for none.</summary>
     /// <param name="waitMs">Requested wait, or null.</param>
-    /// <returns>The effective wait in milliseconds.</returns>
-    public static int ClampWaitMs(int? waitMs) =>
-        Math.Clamp(waitMs ?? DefaultWaitMs, 0, MaxWaitMs);
+    /// <returns>The wait in milliseconds; <see cref="CheckWaits"/> has already refused one out of range.</returns>
+    public static int EffectiveWaitMs(int? waitMs) => waitMs ?? DefaultWaitMs;
+
+    /// <summary>
+    /// The refusal for the first step whose wait is negative or longer than <see cref="MaxWaitMs"/>, naming the
+    /// case, the step and the limit; <c>null</c> when every wait can run as asked.
+    /// </summary>
+    /// <param name="cases">The run's cases.</param>
+    /// <returns>The refusal text, or <c>null</c>.</returns>
+    public static string? CheckWaits(IReadOnlyList<RunTestCase> cases)
+    {
+        foreach (var c in cases)
+            for (var i = 0; i < (c.Steps?.Count ?? 0); i++)
+                if (c.Steps![i].WaitMs is int w && (w < 0 || w > MaxWaitMs))
+                    return string.Create(CultureInfo.InvariantCulture,
+                        $"Case '{c.Name}' step {i + 1} asks for a {w:N0} ms wait; " +
+                        $"a wait must be 0 to {MaxWaitMs:N0} ms. Nothing was written.");
+        return null;
+    }
+
+    /// <summary>
+    /// The refusal for the first case whose <c>keep</c> names a tag the case never sets; <c>null</c> when every kept
+    /// tag is one the case writes.
+    /// </summary>
+    /// <param name="cases">The run's cases.</param>
+    /// <returns>The refusal text, or <c>null</c>.</returns>
+    public static string? CheckKeep(IReadOnlyList<RunTestCase> cases)
+    {
+        foreach (var c in cases)
+        {
+            var sets = SetsOf(c).Select(s => s.Tag).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            foreach (var k in c.Keep ?? [])
+                if (!sets.Contains(k))
+                    return $"Case '{c.Name}' keeps '{k}', which it never sets. Nothing was written.";
+        }
+        return null;
+    }
 
     /// <summary>
     /// Runs the gates, then the cases. Never throws for gate, validation or tag errors.
@@ -282,6 +337,12 @@ public static class RunTestHandler
                     "LimitExceeded", ProductName: identity.ProductName,
                     Hint: $"Split the case into cases of at most {MaxStepsPerCase} steps.");
         }
+        if (CheckWaits(cases) is { } waitRefusal)
+            return new RunTestError(waitRefusal, "LimitExceeded", ProductName: identity.ProductName,
+                Hint: $"Split a longer wait into several steps of at most {MaxWaitMs:N0} ms.");
+        if (CheckKeep(cases) is { } keepRefusal)
+            return new RunTestError(keepRefusal, "InvalidTest", ProductName: identity.ProductName,
+                Hint: "List in keep only tags the case writes in its setup or a step's set.");
 
         // ── Test write rules: every tag of every case, before anything is written ──
         // In Echo simulation mode the rules are not applied and no write gate is needed; Echo itself still
@@ -362,7 +423,7 @@ public static class RunTestHandler
                     : results.All(r => r.Result == "pass") ? "pass" : "fail";
         AuditLogger.LogTestRun(overall, results.Select(r => (r.Name, r.Result)), total.ElapsedMilliseconds);
         return new RunTestResult(overall, identity.ProductName, results, total.ElapsedMilliseconds,
-            restored, restoreFails);
+            restored, restoreFails, results.SelectMany(r => r.Kept ?? []).ToList());
     }
 
     private static Task<EmulatorIdentityInfo> DefaultIdentityReader(string host, CancellationToken ct) =>
@@ -410,12 +471,22 @@ public static class RunTestHandler
         }
         finally
         {
-            // Always restore, even on failure, exception or cancellation (hence CancellationToken.None).
-            restored = await RestoreAsync(snapshot, service, writer).ConfigureAwait(false);
+            // Always restore, even on failure, exception or cancellation (hence CancellationToken.None), except the
+            // tags the case keeps.
+            var keep = (c.Keep ?? []).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            restored = await RestoreAsync(snapshot.Where(s => !keep.Contains(s.Tag)).ToList(), service, writer)
+                .ConfigureAwait(false);
+        }
+
+        var kept = new List<RunTestKeptEntry>();
+        foreach (var (tag, before) in snapshot.Where(s => (c.Keep ?? []).Contains(s.Tag, StringComparer.OrdinalIgnoreCase)))
+        {
+            kept.Add(new RunTestKeptEntry(tag, before.Value, before.DataType));
+            AuditLogger.LogTestKept(c.Name, tag, before.Value, before.DataType);
         }
 
         return new RunTestCaseResult(c.Name, pass ? "pass" : "fail", steps, sw.ElapsedMilliseconds,
-            error, disclosed, restored);
+            error, disclosed, restored, kept);
     }
 
     private static async Task<(bool Pass, string? Error)> RunBodyAsync(
@@ -431,7 +502,7 @@ public static class RunTestHandler
         {
             var written   = new List<object>();
             var writeErr  = await WriteAllAsync(step.Set, writer, written, ct).ConfigureAwait(false);
-            var waitMs    = ClampWaitMs(step.WaitMs);
+            var waitMs    = EffectiveWaitMs(step.WaitMs);
             if (writeErr is not null)
             {
                 steps.Add(new RunTestStepResult(written, waitMs, [], "fail", writeErr));
@@ -511,6 +582,13 @@ public static class RunTestHandler
             return new RunTestExpectResult(e.Tag, expected, null, "fail", $"read failed: {outcome.Error?.Message}");
 
         var observed = read.Value;
+        if (e.EqualsValue is null && e.Min is null && e.Max is null)
+            return new RunTestExpectResult(e.Tag, expected, observed, "fail",
+                "expectation needs one of equals, min or max");
+        if ((e.Min is not null || e.Max is not null) && !TryDouble(observed, out _))
+            return new RunTestExpectResult(e.Tag, expected, observed, "fail",
+                $"a range check cannot be evaluated on a {read.DataType ?? "non-numeric"} value; use equals");
+
         var ok = true;
         if (e.EqualsValue is { } eq)
             ok &= WriteTagHandler.ValuesMatch(ToValue(eq), observed, read.DataType);
@@ -518,9 +596,6 @@ public static class RunTestHandler
             ok &= TryDouble(observed, out var d) && d >= min;
         if (e.Max is { } max)
             ok &= TryDouble(observed, out var d2) && d2 <= max;
-        if (e.EqualsValue is null && e.Min is null && e.Max is null)
-            return new RunTestExpectResult(e.Tag, expected, observed, "fail",
-                "expectation needs one of equals, min or max");
         return new RunTestExpectResult(e.Tag, expected, observed, ok ? "pass" : "fail");
     }
 
@@ -533,11 +608,17 @@ public static class RunTestHandler
         return string.Join(", ", parts);
     }
 
+    // A number, or a BOOL as 0 or 1, so a range check on a BOOL is evaluated rather than failed.
     private static bool TryDouble(object? v, out double d)
     {
+        if (v is bool b)
+        {
+            d = b ? 1 : 0;
+            return true;
+        }
         try
         {
-            if (v is not null and not string and not bool)
+            if (v is not null and not string)
             {
                 d = Convert.ToDouble(v, CultureInfo.InvariantCulture);
                 return true;

@@ -59,8 +59,19 @@ logix_run_test(confirmedByUser=true, cases=[{
 }])
 ```
 
-`expect` takes `equals`, `min` or `max`. `waitMs` defaults to 200 and is clamped to 0..10000;
-the controller settles within about one ~100 ms poll, so there is no point asserting finer timing.
+`expect` takes `equals`, `min` or `max`; `min`/`max` on a BOOL compare it as 0 or 1. `waitMs`
+defaults to 200 and runs exactly as asked, up to 300000 (5 min): a longer wait refuses the whole
+run (`LimitExceeded`, naming the case and step) before anything is written. The controller settles
+within about one ~100 ms poll, so there is no point asserting finer timing.
+
+A run longer than its sync budget (20 s by default) answers `status: "running"` with a `runId`:
+not a failure. Poll `logix_run_test_status` until `finished`; its `result` is the usual payload.
+Do not split a long test over several calls to stay under a timeout.
+
+To set conditions up in one call and keep them for the next, list those tags in the case's
+`keep`. They are left as written instead of restored; the result's `kept` gives each one's
+`originalValue`. Put them back later with `logix_write`, or with a closing case that sets them
+to those values.
 
 ## 2. What a test may write
 
@@ -75,7 +86,8 @@ the tags it set that plain `logix_write` would deny: tell the engineer about tho
 - `overall`: `pass`, `fail` or `restore_failed`.
 - Per case: `result`, steps with `set`, `observed` vs `expected` and a verdict, `durationMs`.
 - Restore: every tag set is snapshotted before the case and written back afterwards, even when
-  the case fails. `restored: [{tag, value, confirmed}]`. **`restore_failed` names the tags that
+  the case fails, except tags in `keep` (listed in `kept: [{tag, originalValue, dataType}]`).
+  `restored: [{tag, value, confirmed}]`. **`restore_failed` names the tags that
   did not come back: tell the engineer which tags and what value they hold now; do not
   carry on testing.**
 

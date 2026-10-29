@@ -2580,9 +2580,13 @@ public class LogixSdkTools
     [McpServerTool(Name = "logix_run_test")]
     [Description(
         "Run scripted logic tests against the Echo EMULATOR ONLY. Each case is {name, setup?: [{tag, value}], " +
-        "steps: [{set?: [{tag, value}], waitMs?, expect?: [{tag, equals? | min? | max?}]}]}: a step writes its " +
-        "'set' tags, waits waitMs (default 200, clamped to 0..10000), then reads each 'expect' tag and gives a " +
-        "pass/fail verdict. Up to 20 cases and 50 steps per case. Before anything else the server reads the " +
+        "steps: [{set?: [{tag, value}], waitMs?, expect?: [{tag, equals? | min? | max?}]}], keep?: [tag]}: a step writes its " +
+        "'set' tags, waits waitMs (default 200; any wait up to 300000 runs exactly as asked, and a longer or negative one " +
+        "refuses the run with kind 'LimitExceeded', naming the case and step, before anything is written), then reads " +
+        "each 'expect' tag and gives a pass/fail verdict; min/max on a BOOL compare it as 0 or 1. Every tag a case sets is " +
+        "restored at its end except those in keep, which stay as written and are listed in 'kept' with their " +
+        "originalValue (a keep naming a tag the case never sets is refused before anything is written). " +
+        "Up to 20 cases and 50 steps per case. Before anything else the server reads the " +
         "controller's EtherNet/IP ListIdentity: unless the product name starts with 'Emulate' it refuses with " +
         "kind 'EmulatorOnly' naming the observed product name, and with kind 'IdentityUnavailable' when the " +
         "lookup fails. It also needs LGX_ENABLE_LIVE_WRITES=1 and confirmedByUser=true (ask the engineer first). " +
@@ -2591,7 +2595,8 @@ public class LogixSdkTools
         "Access is not Read/Write (including tags lgx-mcp created) and a program-scoped tag are refused with kind " +
         "'TestWriteRefused' before anything is written. Each case lists in ordinaryWriteDenied the tags it set that " +
         "logix_write would deny. Returns {overall: pass|fail, productName, cases: [{name, result, " +
-        "steps: [{set, waitMs, expect: [{tag, expected, observed, verdict}], verdict}], ordinaryWriteDenied, durationMs}], durationMs}. " +
+        "steps: [{set, waitMs, expect: [{tag, expected, observed, verdict}], verdict}], ordinaryWriteDenied, restored, kept, durationMs}], " +
+        "restored, kept, durationMs}. " +
         "Long runs: the run goes on in the server, so a long test needs no splitting. When it outlives the sync " +
         "budget (LGX_RUN_TEST_SYNC_BUDGET_S, default 20 s) the call answers at once with {status: \"running\", runId, " +
         "casesCompleted, casesTotal, message, elapsedMs}: this is not a failure. Do not call logix_run_test again; " +

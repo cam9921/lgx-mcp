@@ -674,8 +674,9 @@ public class LibPlcTagServiceTests
             if (line.StartsWith("//") || !line.Contains("GetSize", StringComparison.Ordinal)) continue;
 
             if (line == "int GetSize();" || line == "public int GetSize() => tag.GetSize();"
-                || line == "public int GetSize() => bytes.Length;")
-                continue; // interface declaration / adapters (the live tag, a copy of its bytes)
+                || line == "public int GetSize() => bytes.Length;"
+                || line == "return new BytesTagBuffer(CopyBytes(tag.GetSize(), tag.GetUInt8, tag.GetStatus));")
+                continue; // interface declaration / adapters (the live tag, a copy of its bytes) / the byte copy
 
             Assert.True(line == "var size = buffer.GetSize();",
                 $"GetSize() used outside the size cross-check at line {i + 1}: {line}");

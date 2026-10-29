@@ -1430,6 +1430,33 @@ public static class AuditLogger
     }
 
     /// <summary>
+    /// Appends one <c>test_step</c> audit event as soon as a <c>logix_run_test</c> step has finished, with what it
+    /// wrote, its wait and each check's expected and observed value, so a run's full detail survives a reply the
+    /// client never received.
+    /// </summary>
+    /// <param name="caseName">The case the step belongs to.</param>
+    /// <param name="stepNumber">The step's number within the case, from 1.</param>
+    /// <param name="step">The step's result.</param>
+    public static void LogTestStep(string caseName, int stepNumber, RunTestStepResult step)
+    {
+        Append(new
+        {
+            ts      = Timestamp(),
+            @event  = "test_step",
+            @case   = caseName,
+            step    = stepNumber,
+            set     = step.Set,
+            wait_ms = step.WaitMs,
+            expect  = step.Expect.Select(e => new
+            {
+                tag = e.Tag, expected = e.Expected, observed = e.Observed, verdict = e.Verdict, error = e.Error,
+            }).ToArray(),
+            verdict = step.Verdict,
+            error   = step.Error,
+        });
+    }
+
+    /// <summary>
     /// Appends an <c>edits_cancelled</c> audit event for one
     /// <c>logix_cancel_pending_edits</c> call — the Studio-GUI-driven
     /// cancellation of a routine's pending edit zone.

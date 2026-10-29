@@ -38,6 +38,7 @@ public static class SdkToolNames
         "logix_untest_pending_edits",
         "logix_assemble_pending_edits",
         "logix_run_test",
+        "logix_run_test_status",
         "logix_build",
     ];
 }

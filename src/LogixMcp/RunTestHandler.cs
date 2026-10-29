@@ -435,6 +435,7 @@ public static class RunTestHandler
             if (writeErr is not null)
             {
                 steps.Add(new RunTestStepResult(written, waitMs, [], "fail", writeErr));
+                AuditLogger.LogTestStep(c.Name, steps.Count, steps[^1]);
                 pass = false;
                 break;
             }
@@ -450,6 +451,7 @@ public static class RunTestHandler
             var ok = expects.All(x => x.Verdict == "pass");
             pass &= ok;
             steps.Add(new RunTestStepResult(written, waitMs, expects, ok ? "pass" : "fail"));
+            AuditLogger.LogTestStep(c.Name, steps.Count, steps[^1]);
         }
         return (pass, null);
     }

@@ -168,7 +168,7 @@ public class PublicDocsTests
     public void Readme_ToolOverview_ListsEveryRegisteredTool_GroupedAsDocumented()
     {
         AssertExactlyTheRegisteredTools("README.md", includeSdkTools: true);
-        Assert.Equal(42, GetAllToolNamesIncludingSdk().Count);
+        Assert.Equal(43, GetAllToolNamesIncludingSdk().Count);
 
         var readme = File.ReadAllText(Path.Combine(PublicRoot, "README.md"));
         var overview = readme[readme.IndexOf("## Tools", StringComparison.Ordinal)..];

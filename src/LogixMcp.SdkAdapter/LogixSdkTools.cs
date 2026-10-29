@@ -36,6 +36,7 @@ public class LogixSdkTools
     private readonly TagSessionService _tagSessionService;
     private readonly Capabilities?     _capabilities;
     private readonly StudioConfirmWait _confirmWait;
+    private readonly RunTestJobs       _runTestJobs;
 
     /// <summary>
     /// Initialises a new <see cref="LogixSdkTools"/> with the injected services.
@@ -56,13 +57,19 @@ public class LogixSdkTools
     /// Publish/lifecycle call tracker for the Studio confirmation wait. When <c>null</c>,
     /// <see cref="StudioConfirmWait.Shared"/> is used; tests pass their own instance.
     /// </param>
+    /// <param name="runTestJobs">
+    /// Registry of <c>logix_run_test</c> runs. When <c>null</c>, <see cref="RunTestJobs.Shared"/> is used; tests
+    /// pass their own instance.
+    /// </param>
     public LogixSdkTools(
         ProjectService    projectService,
         TagSessionService tagSessionService,
         Capabilities?     capabilities = null,
-        StudioConfirmWait? confirmWait = null)
+        StudioConfirmWait? confirmWait = null,
+        RunTestJobs?      runTestJobs = null)
     {
         _confirmWait       = confirmWait ?? StudioConfirmWait.Shared;
+        _runTestJobs       = runTestJobs ?? RunTestJobs.Shared;
         ArgumentNullException.ThrowIfNull(projectService);
         ArgumentNullException.ThrowIfNull(tagSessionService);
         _projectService    = projectService;
@@ -2548,6 +2555,27 @@ public class LogixSdkTools
         return JsonSerializer.Serialize(result, result.GetType());
     }
 
+    /// <summary>
+    /// Runs <see cref="GetRunTestResponseAsync"/> as a server-side job (see <see cref="RunTestJobs"/>): the result
+    /// itself when the run finishes within <paramref name="syncBudget"/>, otherwise a <c>running</c> payload with
+    /// its run id. The run is never cancelled by the caller going away, so it always restores what it wrote.
+    /// </summary>
+    /// <param name="cases">Scripted test cases.</param>
+    /// <param name="confirmedByUser">Must be true.</param>
+    /// <param name="syncBudget">How long to wait before answering <c>running</c>.</param>
+    /// <returns>JSON string.</returns>
+    public Task<string> GetBudgetedRunTestResponseAsync(
+        IReadOnlyList<RunTestCase>? cases, bool confirmedByUser, TimeSpan syncBudget) =>
+        _runTestJobs.RunAsync(
+            async progress =>
+            {
+                var result = await RunTestHandler.ExecuteAsync(
+                    cases, confirmedByUser, _tagSessionService, _capabilities, ct: CancellationToken.None,
+                    progress: progress).ConfigureAwait(false);
+                return JsonSerializer.Serialize(result, result.GetType());
+            },
+            syncBudget);
+
     /// <summary>Emulator-only scripted logic tests.</summary>
     [McpServerTool(Name = "logix_run_test")]
     [Description(
@@ -2564,6 +2592,12 @@ public class LogixSdkTools
         "'TestWriteRefused' before anything is written. Each case lists in ordinaryWriteDenied the tags it set that " +
         "logix_write would deny. Returns {overall: pass|fail, productName, cases: [{name, result, " +
         "steps: [{set, waitMs, expect: [{tag, expected, observed, verdict}], verdict}], ordinaryWriteDenied, durationMs}], durationMs}. " +
+        "Long runs: the run goes on in the server, so a long test needs no splitting. When it outlives the sync " +
+        "budget (LGX_RUN_TEST_SYNC_BUDGET_S, default 20 s) the call answers at once with {status: \"running\", runId, " +
+        "casesCompleted, casesTotal, message, elapsedMs}: this is not a failure. Do not call logix_run_test again; " +
+        "poll logix_run_test_status with the runId until status is \"finished\", whose 'result' is the payload above. " +
+        "One run at a time: a call while a run is going is refused with kind 'RunTestInProgress' and writes nothing. " +
+        "Every step is also written to the audit log as it finishes (test_step events). " +
         "Call logix_connect (online to the emulator) first. Requires the Logix Designer SDK build " +
         "(EnableLogixSdk=true).")]
     public Task<string> RunTest(
@@ -2574,7 +2608,24 @@ public class LogixSdkTools
         [Description(
             "Must be true: the engineer's go-ahead to write test inputs on the emulator. Defaults to false, which always refuses.")]
         bool confirmedByUser = false) =>
-        GetRunTestResponseAsync(cases, confirmedByUser, progress: TasksSupport.CreateProgress(context));
+        // Clients that declare the Tasks extension keep the task path; every other client gets the budgeted job.
+        TasksSupport.ClientDeclaresTasks(context)
+            ? GetRunTestResponseAsync(cases, confirmedByUser, progress: TasksSupport.CreateProgress(context))
+            : GetBudgetedRunTestResponseAsync(cases, confirmedByUser, RunTestJobs.SyncBudgetFromEnvironment());
+
+    /// <summary>Reports a <c>logix_run_test</c> run that outlived its sync budget.</summary>
+    [McpServerTool(Name = "logix_run_test_status", ReadOnly = true, Idempotent = true, Destructive = false)]
+    [Description(
+        "Read-only. Poll this after logix_run_test answers status=\"running\" (the run keeps going in the server). " +
+        "Returns {status: running|finished|failed, runId, startedAt, elapsedMs, ...}. running adds casesCompleted, " +
+        "casesTotal and message. finished adds 'result': exactly the payload logix_run_test returns for a run that " +
+        "finishes in time (overall, cases with every step and check, restored). failed adds error and kind. Without " +
+        "runId it reports the most recent run. kind 'RunNotFound' when the server knows no such run (a restarted " +
+        "server has none; the audit log keeps every step as test_step events). It never starts, cancels or changes a run.")]
+    public string RunTestStatus(
+        [Description("Run id from logix_run_test's running payload. Optional: omit it for the most recent run.")]
+        string? runId = null) =>
+        _runTestJobs.GetStatus(runId);
 
     /// <summary>
     /// Builds the <c>logix_build</c> response: runs <see cref="BuildHandler"/> on the active session (or the

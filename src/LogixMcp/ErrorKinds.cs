@@ -51,6 +51,14 @@ public static class ErrorKinds
     public const string TestWriteRefused = "TestWriteRefused";
 
     /// <summary>
+    /// A <c>logix_run_test</c> call arrived while an earlier run was still going in the server. Nothing was written.
+    /// </summary>
+    public const string RunTestInProgress = "RunTestInProgress";
+
+    /// <summary><c>logix_run_test_status</c> was asked for a run this server does not know.</summary>
+    public const string RunNotFound = "RunNotFound";
+
+    /// <summary>
     /// The controller fault record (CIP class 0x73 instance 1) could not be read or parsed
     /// (<c>logix_diagnose</c>).
     /// </summary>

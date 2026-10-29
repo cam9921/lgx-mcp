@@ -179,7 +179,7 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                outcomes[i] = new TagReadOutcome(name, null, ex);
+                outcomes[i] = new TagReadOutcome(name, null, WrapReadFailure(ex, name, "grouped read"));
             }
         }
         return outcomes!;
@@ -218,7 +218,7 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
         return await UseTagAsync(handle, async tag =>
         {
             await SafeReadAsync(tag, handle, ct);
-            return (ITagBuffer)new BytesTagBuffer(tag.GetBuffer());
+            return CopyReadBytes(tag, handle);
         }, ct);
     }
 
@@ -268,7 +268,7 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
                     ? CipTypeResolution.Unresolved("No type resolver is attached to this CIP session.")
                     : await TypeResolver.ResolveAsync(tagName, cancellationToken));
 
-                return DecodeValue(tagName, resolution, new LibPlcTagBuffer(tag));
+                return DecodeValue(tagName, resolution, CopyReadBytes(tag, tagName));
             }, cancellationToken);
         }
         catch (TagServiceException ex) when (ex.Error.Kind == TagServiceErrorKind.WriteDenied)
@@ -353,7 +353,7 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
             }
             catch (LibPlcTagException ex)
             {
-                throw MapException(ex, tag.GetStatus(), tagName);
+                throw MapException(ex, tag.GetStatus(), tagName, "write");
             }
             catch (OperationCanceledException)
             {
@@ -403,7 +403,7 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
         }
         catch (LibPlcTagException ex)
         {
-            throw MapException(ex, tag.GetStatus(), null);
+            throw MapException(ex, tag.GetStatus(), null, "tag list read");
         }
         catch (OperationCanceledException)
         {
@@ -541,7 +541,7 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
         }
         catch (LibPlcTagException ex)
         {
-            throw MapException(ex, tag.GetStatus(), tagName);
+            throw MapException(ex, tag.GetStatus(), tagName, "initialize");
         }
         catch (OperationCanceledException)
         {
@@ -572,7 +572,7 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
         }
         catch (LibPlcTagException ex)
         {
-            throw MapException(ex, tag.GetStatus(), tagName);
+            throw MapException(ex, tag.GetStatus(), tagName, "read");
         }
         catch (OperationCanceledException)
         {
@@ -690,7 +690,7 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
             return await UseTagAsync(wordPath, async tag =>
             {
                 await SafeReadAsync(tag, wordPath, ct);
-                return DecodeBoolArrayElement(tagName, bit, new LibPlcTagBuffer(tag));
+                return DecodeBoolArrayElement(tagName, bit, CopyReadBytes(tag, wordPath));
             }, ct);
         }
         catch (TagServiceException ex) when (ex.Error.Kind == TagServiceErrorKind.WriteDenied)
@@ -735,7 +735,7 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
             return await UseTagAsync(parentPath, async tag =>
             {
                 await SafeReadAsync(tag, parentPath, ct);
-                return DecodeBit(tagName, parentType, bit, new LibPlcTagBuffer(tag));
+                return DecodeBit(tagName, parentType, bit, CopyReadBytes(tag, parentPath));
             }, ct);
         }
         catch (TagServiceException ex) when (ex.Error.Kind == TagServiceErrorKind.WriteDenied)
@@ -820,20 +820,46 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
         public double GetFloat64(int offset) => BinaryPrimitives.ReadDoubleLittleEndian(bytes.AsSpan(offset));
     }
 
-    private sealed class LibPlcTagBuffer(Tag tag) : ITagBuffer
+    // Copies the bytes of a tag that has just been read, mapping a libplctag failure to an error naming the tag.
+    private static ITagBuffer CopyReadBytes(Tag tag, string tagName)
     {
-        public int GetSize() => tag.GetSize();
-        public bool GetBit(int offset) => tag.GetBit(offset);
-        public sbyte GetInt8(int offset) => tag.GetInt8(offset);
-        public byte GetUInt8(int offset) => tag.GetUInt8(offset);
-        public short GetInt16(int offset) => tag.GetInt16(offset);
-        public ushort GetUInt16(int offset) => tag.GetUInt16(offset);
-        public int GetInt32(int offset) => tag.GetInt32(offset);
-        public uint GetUInt32(int offset) => tag.GetUInt32(offset);
-        public long GetInt64(int offset) => tag.GetInt64(offset);
-        public ulong GetUInt64(int offset) => tag.GetUInt64(offset);
-        public float GetFloat32(int offset) => tag.GetFloat32(offset);
-        public double GetFloat64(int offset) => tag.GetFloat64(offset);
+        try
+        {
+            return new BytesTagBuffer(CopyBytes(tag.GetSize(), tag.GetUInt8, tag.GetStatus));
+        }
+        catch (LibPlcTagException ex)
+        {
+            throw MapException(ex, tag.GetStatus(), tagName, "copy of the value read");
+        }
+    }
+
+    /// <summary>
+    /// Copies a read tag's bytes one at a time. Every typed getter of libplctag.NET 1.0.0 throws a bare
+    /// <see cref="LibPlcTagException"/> whenever the value it reads equals its error sentinel (<c>GetUInt8</c> on
+    /// 0xFF, <c>GetInt32</c> on <see cref="int.MinValue"/>, <c>GetUInt32</c> on <see cref="uint.MaxValue"/>, ...)
+    /// without checking the tag's status, so a value holding such a byte or equal to such a sentinel would read as a
+    /// failure. Here a throw counts only when the tag's status is not Ok; with the status Ok the byte is 0xFF.
+    /// Every value is then decoded from the copy.
+    /// </summary>
+    /// <param name="size">The tag's size in bytes.</param>
+    /// <param name="getUInt8">The tag's byte getter.</param>
+    /// <param name="getStatus">The tag's status.</param>
+    /// <returns>The bytes, little-endian, as the controller sent them.</returns>
+    internal static byte[] CopyBytes(int size, Func<int, byte> getUInt8, Func<Status> getStatus)
+    {
+        var bytes = new byte[size];
+        for (var i = 0; i < size; i++)
+        {
+            try
+            {
+                bytes[i] = getUInt8(i);
+            }
+            catch (LibPlcTagException) when (getStatus() == Status.Ok)
+            {
+                bytes[i] = byte.MaxValue;
+            }
+        }
+        return bytes;
     }
 
     /// <summary>
@@ -1333,10 +1359,15 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
     /// <c>ErrorBadParam</c>/<c>ErrorBadConfig</c>/<c>ErrorBadData</c> map to
     /// <see cref="TagServiceErrorKind.ProtocolError"/> with the raw status name
     /// and tag in the message; <see cref="TagServiceErrorKind.TypeMismatch"/> is
-    /// reserved for the server's own pre-wire value conversion failures.
+    /// reserved for the server's own pre-wire value conversion failures. Every message names the operation, the
+    /// tag and libplctag's status with its numeric code.
     /// </summary>
+    /// <param name="ex">The libplctag failure.</param>
+    /// <param name="status">The tag's status after the failure.</param>
+    /// <param name="tagName">The tag, if any.</param>
+    /// <param name="operation">What failed: "read", "write", "initialize", ...</param>
     internal static TagServiceException MapException(
-        LibPlcTagException ex, Status status, string? tagName)
+        LibPlcTagException ex, Status status, string? tagName, string operation = "operation")
     {
         var kind = status switch
         {
@@ -1364,19 +1395,40 @@ public sealed class LibPlcTagService : ITagService, IAliasAware
             _                           => TagServiceErrorKind.Unknown,
         };
 
-        var message = kind == TagServiceErrorKind.OutOfBounds
-            ? $"libplctag {status}" +
-              (tagName is null ? "" : $" for tag '{tagName}'") +
-              $": {ex.Message}"
-            : kind == TagServiceErrorKind.ProtocolError
-            ? $"libplctag protocol error {status}" +
-              (tagName is null ? "" : $" for tag '{tagName}'") +
-              $": {ex.Message}"
-            : ex.Message;
+        // libplctag's own text is kept only when it says more than the status name; a bare
+        // LibPlcTagException says nothing at all.
+        var detail = ex.Message == status.ToString() || ex.Message == BareLibPlcTagExceptionMessage
+            ? ""
+            : $": {ex.Message}";
+        var message = $"libplctag {operation}" +
+                      (tagName is null ? "" : $" of '{tagName}'") +
+                      $" failed with status {status} ({(int)status}){detail}";
 
         return new TagServiceException(
             new TagServiceError(kind, message, tagName), ex);
     }
+
+    private static readonly string BareLibPlcTagExceptionMessage = new LibPlcTagException().Message;
+
+    /// <summary>
+    /// Wraps a failure that is not already a <see cref="TagServiceException"/> so its message still names the
+    /// operation and the tag (and libplctag's status when there is one).
+    /// </summary>
+    /// <param name="ex">The failure.</param>
+    /// <param name="tagName">The tag being read.</param>
+    /// <param name="operation">What failed.</param>
+    internal static TagServiceException WrapReadFailure(Exception ex, string tagName, string operation) =>
+        ex switch
+        {
+            TagServiceException tse => tse,
+            // A LibPlcTagException built from a status carries the status name as its message.
+            LibPlcTagException lpe when Enum.TryParse<Status>(lpe.Message, out var status)
+                => MapException(lpe, status, tagName, operation),
+            LibPlcTagException => new TagServiceException(new TagServiceError(TagServiceErrorKind.Unknown,
+                $"libplctag {operation} of '{tagName}' failed with no status", tagName), ex),
+            _ => new TagServiceException(new TagServiceError(TagServiceErrorKind.Unknown,
+                $"{operation} of '{tagName}' failed: {ex.GetType().Name}: {ex.Message}", tagName), ex),
+        };
 
     /// <summary>
     /// True when <paramref name="status"/> is a defined libplctag error status
